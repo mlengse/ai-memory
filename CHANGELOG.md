@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only `title`/`projectID` on `session.created`, so the marker never reached the
   server and the opt-in was a silent no-op for OpenCode. Root sessions (no
   `parentID`) stay unmarked (#755).
+- `memory_recent` no longer overloads the `rank` field with the page's
+  `updated_at` timestamp (µs), which made `rank` mean a relevance score in
+  `memory_query` and a raw timestamp in `memory_recent`. Recency listings now
+  report `rank` as the 0-based recency position and carry the timestamp in a new
+  `updated_at_us` field (`None`, and omitted from JSON, for search hits), so
+  `rank` means the same thing — a sort key, lower is better — across both tools
+  (F-006).
 
 ## [2.3.1] - 2026-09-17
 

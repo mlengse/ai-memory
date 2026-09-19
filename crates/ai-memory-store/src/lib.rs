@@ -2790,6 +2790,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_hits_carry_a_positional_rank_and_the_updated_at_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "one.md", "Body one"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "two.md", "Body two"))
+            .await
+            .unwrap();
+
+        let hits = store
+            .reader
+            .recent_pages_for_project(ws, proj, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        for (idx, hit) in hits.iter().enumerate() {
+            // `rank` is the 0-based recency position, never the µs timestamp
+            // (which previously leaked into the rank field).
+            assert_eq!(
+                hit.rank, idx as f64,
+                "recent rank must be positional: {hit:?}"
+            );
+            assert!(
+                hit.updated_at_us
+                    .is_some_and(|us| us > 1_000_000_000_000_000),
+                "recent hits must carry the µs updated_at: {hit:?}"
+            );
+        }
+
+        // Search hits keep the relevance rank and carry no recency timestamp.
+        let searched = store
+            .reader
+            .search_pages_for_project(ws, proj, "Body".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(!searched.is_empty(), "the FTS search should match");
+        assert!(
+            searched.iter().all(|h| h.updated_at_us.is_none()),
+            "search hits must not carry updated_at_us: {searched:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn hybrid_search_includes_linked_neighbors() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
