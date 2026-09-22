@@ -7,7 +7,185 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Bumped `rmcp` to 2.x (2.2.0), resolving three MCP transport advisories:
+  GHSA-9pj6-vhgr-3mwh (unauthenticated Streamable-HTTP session-table leak /
+  DoS), GHSA-33f5-2c5q-wgwj (missing OAuth resource-field validation), and
+  GHSA-9g45-5xwm-f3wc (custom headers leaking to cross-origin redirect
+  targets). Behavior-preserving: the only source change is the
+  `rmcp::model::Content` → `ContentBlock` rename (imported under the prior
+  name), the feature set is unchanged, and the 23-tool MCP surface is
+  unaffected. (#794)
+
+### Docs
+- Stopped recommending `AI_MEMORY_LLM_MODEL=gpt-5-mini` for the `openai-oauth`
+  provider in `docs/llm-providers.md` and `docs/install.md`. The Codex/ChatGPT
+  backend only accepts a small server-defined set of model ids and rejects
+  others (including `gpt-5-mini`) with a deterministic 400; the docs now advise
+  leaving the provider default (`gpt-5.5`) for `openai-oauth`/`codex`, keep
+  `claude-haiku-4-5` for `anthropic-oauth`, and qualify `gpt-5-mini` for
+  `copilot` as unverified. (#831)
+- `docs/llm-providers.md` now covers the `opencode` LLM provider, which has
+  shipped since 1.x but was missing from the recommended-defaults table:
+  `OPENCODE_API_KEY` as the only credential, Go as the default endpoint, Zen
+  via `AI_MEMORY_LLM_BASE_URL`, the built-in default model, per-catalogue
+  model ids, and which model goes through the Responses endpoint (#763).
+
 ### Fixed
+- A failed scheduled `auto_improve` review no longer removes its session from
+  the queue permanently. The scheduler claims a session before reviewing it,
+  and the candidate query excludes any session that holds a claim — but nothing
+  ever released one, so a review that failed (a hung provider call, or a
+  proposal the reviewer could not stage) left a claim with no run row and that
+  session was skipped by every later tick. The state was silent: the tick
+  reported `errors=1` once and clean runs from then on, and the only exit was a
+  hand-written `DELETE`. A claim now records the failure and releases, so the
+  next tick retries it, and parks after 3 attempts with the last error kept so a
+  deterministic failure stops costing a review every tick instead of vanishing.
+  The tick summary counts `parked` separately from `errors`. (#833)
+- The auto-improve reviewer now excludes `sessions/` pages from its own
+  recent-page context so those slots go to durable pages (`decisions/`,
+  `gotchas/`, `_rules/`, …) it might otherwise re-propose. Session pages are
+  never valid proposal targets and previously dominated the recency-ordered
+  list, crowding durable knowledge out of the reviewer's view. The exclusion is
+  scoped to the reviewer only — the SessionStart briefing and `memory_briefing`
+  still include session pages. `docs/auto-improvement-loop.md` now documents
+  that only `_rules/`/`procedures/` page bodies reach the reviewer and that the
+  recent-page list is recency-ordered, with configurable patchable prefixes and
+  embedding-nearest dedup noted as deferred future work. (#834)
+- Auto-improve proposal staging no longer discards an entire run when one
+  proposal is a create/update misclassification. A `Create` whose target page
+  already exists, or an `Update`/patch whose target is missing, previously
+  aborted the staging transaction, dropping every sibling proposal and the run
+  row over one probabilistic LLM mislabel. Those two cases now skip just the
+  offending proposal (reported as `skipped`, like a pending-target collision)
+  and keep the rest of the run. Two proposals in one run targeting the same
+  path remain a hard error, and a create-on-existing is never coerced to an
+  update (the page could be pinned). (#832)
+- The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
+  provider credentials and host-config env vars as the POSIX wrapper into the
+  helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
+  Copilot token, `OPENCODE_API_KEY`, `CLAUDE_CONFIG_DIR`, or
+  `AI_MEMORY_WORKSTREAM_ID` previously never reached `Config::load`, so
+  `llm-test`, Copilot auth, OpenCode, and a relocated Claude config all
+  reported "not configured" on native Windows Docker Desktop even though the
+  same export worked through `bin/ai-memory`. The POSIX wrapper also now
+  forwards `OPENCODE_API_KEY`. (#803)
+- `Config::load` now treats Windows `%USERPROFILE%` (then `dirs::home_dir`) as
+  the operator home when `AI_MEMORY_HOME` and `$HOME` are unset. Native
+  Windows often has no `HOME`, so the #103 catch-all guard — skip a stored
+  `repo_path` equal to the user profile so it cannot prefix-match every
+  project beneath it — was inert there and a home-directory project could
+  swallow unrelated cwds. (#804)
+- Automatic handoff selection and cwd-prefix project matching now treat
+  Windows drive-letter and UNC paths as case-insensitive. A Linux server
+  (the Docker Desktop helper) comparing host cwds from Explorer, Git, and
+  PowerShell previously required a byte-exact match, so `C:\Users\…\repo`
+  vs `c:\users\…\repo` missed the pending auto-handoff and could mint a
+  fragment project. Unix paths stay case-sensitive. (#806)
+- Fixed `Ctrl+C` at the native-session chooser leaving the launcher alive and
+  renewing its workstream lease. Cancelling now releases the acquired run and
+  exits without waiting for Enter or linking a native session (#795).
+- The privacy strip now redacts Windows credential paths (`C:\Users\…\.ssh`,
+  `.aws`, `.kube`, `.gnupg`, `.config\gcloud`). The previous patterns required
+  a POSIX `/` separator, so a captured tool result that echoed a native
+  Windows path stored the profile directory and key file name verbatim. (#805)
+- The privacy strip now redacts secrets written in JSON. The quote before a
+  value put it outside the value character class, so `{"db_password":"..."}`
+  was stored verbatim while the identical YAML form was redacted, and JSON is
+  the shape most captured tool payloads arrive in. The same rule now also
+  accepts an auth scheme word before the value, so
+  `Authorization: Basic <base64>` (which carries `user:password`) is redacted
+  like the `Bearer` form already was, and covers two unprefixed names the
+  generic env rule missed: Azure `AccountKey=` and npm `_authToken=`. (#800)
+- Terminal escape sequences, NUL and bidi override characters are stripped
+  from captured text instead of being stored. Page bodies and observations are
+  replayed to a terminal by `ai-memory read-page` and `ai-memory search`, where
+  an escape rewrites the screen or the window title and a bidi override
+  reverses what the reader sees; a NUL additionally made the markdown file
+  binary, costing it `grep` and git diffs. Tabs, newlines and carriage returns
+  are kept. (#800)
+- A page write is refused when another live page in the same project differs
+  from it only by case or Unicode normalization. Such a pair is one file on
+  macOS (APFS) and Windows (NTFS), so creating the second silently overwrote
+  the first page's file while the index kept both rows, so reads for either path
+  then returned the survivor's body, and the wiki watcher superseded the
+  overwritten row, losing the original content from disk and index alike. The
+  refusal names both paths, applies on every platform (the wiki is synced
+  between them), and leaves supersedes of an existing path untouched.
+  `reindex` skips such a pair instead of failing the whole rebuild, reports the
+  count, and logs each one. (#799)
+
+## [2.3.2] - 2026-09-20
+
+### Changed
+- `memory_consolidate` accepts an omitted `session_id`. Omitting the field (or
+  sending `null`) no longer fails deserialization with `missing field
+  session_id`; the tool consolidates the latest completed session in the
+  resolved project — the same default `memory_auto_improve` and
+  `memory_read_session_observations` already use. Pass an explicit UUID to
+  target a specific session, and `dry_run=true` for the cheap admission
+  preflight. A project with no completed session now fails as
+  `no completed session in <scope>` instead of a deserialization error.
+- A consolidation LLM call that fails on a transient provider error (`429`, any
+  `5xx`, a transport timeout or connect failure) is retried twice, two seconds
+  apart, before the failure is reported — the same bounded policy `bootstrap`
+  already applies to its chunks. Deterministic failures (auth, schema, a
+  malformed-request `4xx`, unparseable or truncated output) are still reported
+  on the first attempt, since retrying them only burns another call.
+
+### Fixed
+- CLI commands no longer fail at startup when an `[[llm_fallbacks]]` profile's
+  `api_key_env` variable is absent from the invoking shell. `Config::load`
+  validated every fallback credential eagerly, so read-only commands such as
+  `ai-memory status` exited with `llm_fallbacks[0].api_key_env=... is set but
+  the environment variable is missing or empty` even when the running server
+  had the key injected by its service wrapper, which pushed operators to export
+  provider keys in every shell. The missing credential is now enforced where it
+  is needed: `ai-memory serve` still refuses to start without it, and building
+  the LLM chain still fails rather than silently dropping the fallback. Every
+  other profile check (provider, model, base URL) still runs at load for every
+  command (#762).
+- `backfill --dry-run` recorded a completed attempt and suppressed the next
+  automatic import. Planning now leaves the backfill sentinel untouched, even
+  for populated projects or an opted-out automatic invocation (#785).
+- `ai-memory serve` no longer hard-fails to take its single-instance lock on a
+  transient error under load. Acquiring the serve lock now retries `open` and
+  `try_lock_exclusive` a few times with a short (~25ms) backoff when they hit a
+  transient failure (EMFILE/ENFILE fd exhaustion, EINTR), mirroring
+  `acquire_drain_lock`. A genuinely contended lock (`WouldBlock`, another server
+  holds it) is never retried and still refuses startup immediately. The
+  serve-lock tests also assert with the concrete errno so any remaining
+  environmental flake is diagnosable rather than silent (#745).
+- GitHub Copilot completion requests now select the model-advertised API
+  endpoint from `/models`: existing Chat Completions remains preferred when
+  available, while Responses-only models use `/responses`. Responses requests
+  preserve strict JSON Schema structured-output constraints and report empty,
+  refused, or rejected output without silently downgrading the contract. A model
+  the `/models` catalogue does not enumerate (enterprise/custom deployments,
+  aliases, a model newer than the list) falls back to Chat Completions with a
+  warning instead of erroring, matching the graceful fallback already used when
+  `/models` is unavailable. As a related behavior change, a Copilot chat
+  completion that returns empty content now reports `UnexpectedShape` rather
+  than yielding an empty string. (#761)
+- The V62 page-ingestion-window migration no longer runs its backfill inside a
+  single migration transaction, which on a large store ran for hours and grew
+  the WAL to roughly the size of the database with no progress. V62 is now
+  DDL-only (the two columns plus their index); the window backfill moved to a
+  chunked, resumable, WAL-bounded boot-path step that processes pages in bounded
+  batches, checkpoints the WAL (`TRUNCATE`) between each, and logs progress. The
+  end state is byte-identical to the original V62, the step resumes rather than
+  restarts if interrupted, and it is a fast no-op on a store that already applied
+  the original V62. Because that reshape changes the migration's checksum, the
+  runner now intentionally tolerates a divergent checksum on an already-applied
+  migration (`abort_divergent = false`) so correctly-migrated stores still open;
+  the schema-ahead guard (`abort_missing`) is unchanged (#776).
+- Page writes now refuse git-reserved and non-portable page paths (a `.git`
+  component or an 8.3 `git~1`..`git~4` alias, Windows-reserved names and
+  characters) on every write funnel, including MCP `memory_write_page` and
+  consolidation `apply_batch`; reads of already-stored pages stay tolerant so
+  a bad row never breaks a listing. The git-reserved check is byte-safe and no
+  longer panics on a 5-byte multibyte path component (#781).
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted
@@ -21,6 +199,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `updated_at_us` field (`None`, and omitted from JSON, for search hits), so
   `rank` means the same thing — a sort key, lower is better — across both tools
   (F-006).
+- Scope-resolution failures over MCP now answer with `invalid params`
+  (`-32602`) instead of an opaque internal error (`-32603`), the same split the
+  web route applies with its 400/404: a malformed scope argument, or a
+  workspace/project name that does not resolve, is caller input, while a
+  missing writer handle or an underlying store failure stays internal. The
+  messages are unchanged.
+- `memory_consolidate` treats a blank `session_id` (`""` or whitespace) exactly
+  like an omitted one — the resolved project's latest completed session — and a
+  malformed id now fails as `invalid params`, the code `memory_auto_improve`
+  already uses for the same argument.
+- `backfill` returned success even when imports failed, and `--quiet` hid
+  their diagnostics. It now reports errors on stderr, includes failure counts
+  in the human summary, and exits nonzero after emitting its report (#786).
 
 ## [2.3.1] - 2026-09-17
 
@@ -5835,7 +6026,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.2...HEAD
+[2.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.2
 [2.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.1
 [2.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.0
 [2.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.2

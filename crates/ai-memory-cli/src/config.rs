@@ -28,6 +28,11 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:49374";
 /// Default base URL used by thin-client CLI subcommands.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
 
+/// Placeholder credential that lets `Config::load` validate a fallback
+/// profile whose `api_key_env` is absent from this process. Never reaches a
+/// provider: the config built from it is discarded (#762).
+const UNRESOLVED_FALLBACK_KEY: &str = "unresolved-llm-fallback-credential";
+
 /// Default MCP endpoint URL rendered for client integrations.
 pub const DEFAULT_MCP_URL: &str = "http://127.0.0.1:49374/mcp";
 
@@ -167,10 +172,11 @@ pub struct Config {
     #[serde(default)]
     pub base_path: String,
     /// Operator home directory, captured once here (the single config-read
-    /// path) from `AI_MEMORY_HOME` or `$HOME`. Used to keep the cwd->project resolver and the
-    /// startup heal from treating `$HOME` as a prefix-match catch-all
-    /// (issue #103) without env reads scattered through the runtime. Not a
-    /// config.toml key: always derived from the process environment at load.
+    /// path) from `AI_MEMORY_HOME`, `$HOME`, or Windows `%USERPROFILE%`. Used
+    /// to keep the cwd->project resolver and the startup heal from treating
+    /// the user profile as a prefix-match catch-all (issue #103) without env
+    /// reads scattered through the runtime. Not a config.toml key: always
+    /// derived from the process environment at load.
     #[serde(skip)]
     pub home_dir: Option<String>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
@@ -248,6 +254,14 @@ pub struct Config {
     /// hand.
     #[serde(skip)]
     pub llm_fallback_configs: Vec<ProviderConfig>,
+    /// One message per `llm_fallbacks` entry whose `api_key_env` names a
+    /// variable absent from this process's environment. Such an entry is left
+    /// out of [`Self::llm_fallback_configs`]; the failure is raised by
+    /// [`Self::require_llm_fallback_credentials`] instead of by `load`, so a
+    /// CLI invocation that never builds the LLM chain does not need the
+    /// server's credentials (#762). Same `pub` rationale as above.
+    #[serde(skip)]
+    pub llm_fallback_unresolved: Vec<String>,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -445,10 +459,16 @@ pub struct RuntimeEnv {
 
 impl RuntimeEnv {
     fn from_process() -> Self {
+        let platform_home = dirs::home_dir();
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
-            home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
-            platform_home: dirs::home_dir(),
+            home_dir: resolve_operator_home(
+                env_string("AI_MEMORY_HOME").as_deref(),
+                env_string("HOME").as_deref(),
+                env_string("USERPROFILE").as_deref(),
+                platform_home.as_deref(),
+            ),
+            platform_home,
             codex_home: env_path("CODEX_HOME"),
             codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
@@ -733,6 +753,7 @@ impl Default for Config {
             llm_headers: Vec::new(),
             llm_fallbacks: Vec::new(),
             llm_fallback_configs: Vec::new(),
+            llm_fallback_unresolved: Vec::new(),
             consolidate_on_session_end: false,
             capture_assistant: false,
             backfill_on_start: true,
@@ -1117,7 +1138,9 @@ impl Config {
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
         // env directly. AI_MEMORY_HOME is accepted for tests/wrappers that need
-        // to emulate a host home distinct from the process HOME.
+        // to emulate a host home distinct from the process HOME. Native Windows
+        // often has no HOME; USERPROFILE (then dirs::home_dir) fills that gap
+        // so the #103 catch-all guard is not inert there.
         config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
         // CLI override always wins (figment doesn't see it because clap has
@@ -1194,16 +1217,31 @@ impl Config {
         // sit unused for months and only fail once the primary is already
         // down. The environment is read here, once, per invariant #1 (no
         // `std::env::var` outside `load`).
+        //
+        // An absent credential is the one failure that is deferred rather than
+        // raised (#762): the variable belongs in the server's environment (a
+        // service wrapper's env block), not in every shell that runs
+        // `ai-memory status`. It is recorded here and enforced by
+        // `require_llm_fallback_credentials` at `serve` startup and by
+        // `llm_provider_chain`, so the server still fails closed.
         let mut fallback_configs = Vec::with_capacity(config.llm_fallbacks.len());
+        let mut unresolved = Vec::new();
         for (i, profile) in config.llm_fallbacks.iter().enumerate() {
-            let resolved_key = match non_empty(profile.api_key_env.as_deref()) {
-                Some(name) => Some(SecretString::from(env_string(name).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "llm_fallbacks[{i}].api_key_env={name} is set but the environment \
-                         variable is missing or empty"
-                    )
-                })?)),
-                None => None,
+            let (resolved_key, missing) = match non_empty(profile.api_key_env.as_deref()) {
+                Some(name) => match env_string(name) {
+                    Some(key) => (Some(SecretString::from(key)), None),
+                    None => (
+                        // Stands in for the absent key so the rest of the
+                        // profile is still validated eagerly below; the
+                        // config built from it is discarded.
+                        Some(SecretString::from(UNRESOLVED_FALLBACK_KEY)),
+                        Some(format!(
+                            "llm_fallbacks[{i}].api_key_env={name} is set but the \
+                             environment variable is missing or empty"
+                        )),
+                    ),
+                },
+                None => (None, None),
             };
             let provider_cfg = config
                 .fallback_provider_config(i, profile, resolved_key)
@@ -1213,9 +1251,13 @@ impl Config {
             // silently sitting unused until the primary has an outage.
             build_provider(provider_cfg.clone())
                 .with_context(|| format!("building llm_fallbacks[{i}]"))?;
-            fallback_configs.push(provider_cfg);
+            match missing {
+                Some(message) => unresolved.push(message),
+                None => fallback_configs.push(provider_cfg),
+            }
         }
         config.llm_fallback_configs = fallback_configs;
+        config.llm_fallback_unresolved = unresolved;
 
         Ok(config)
     }
@@ -1386,6 +1428,24 @@ impl Config {
         }
     }
 
+    /// Fail when an `llm_fallbacks` credential named by `api_key_env` is
+    /// absent from this process's environment.
+    ///
+    /// `serve` calls this at startup, so a fallback that could never
+    /// authenticate stops the server before it runs, whether or not a primary
+    /// provider is configured. Other subcommands do not: they never build the
+    /// chain, and requiring the server's credentials in every shell would
+    /// spread them to every process the operator runs (#762).
+    ///
+    /// # Errors
+    /// Names the first unresolved profile and its variable.
+    pub fn require_llm_fallback_credentials(&self) -> Result<()> {
+        match self.llm_fallback_unresolved.first() {
+            Some(message) => anyhow::bail!("{message}"),
+            None => Ok(()),
+        }
+    }
+
     /// Build the configured LLM provider, including any ordered
     /// `llm_fallbacks` chain.
     ///
@@ -1399,6 +1459,11 @@ impl Config {
     /// Propagates any error from constructing the primary or a fallback
     /// provider (`build_provider` is the sole construction path for both).
     pub fn llm_provider_chain(&self) -> LlmResult<Option<Arc<dyn LlmProvider>>> {
+        // A chain with a profile silently dropped would look healthy until
+        // the primary has an outage.
+        if let Some(message) = self.llm_fallback_unresolved.first() {
+            return Err(LlmError::NotConfigured(message.clone()));
+        }
         let Some(primary_cfg) = self.llm_provider_config()? else {
             return Ok(None);
         };
@@ -1747,6 +1812,32 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
         _ => return None,
     })
+}
+
+/// Operator home used as the #103 catch-all prefix guard.
+///
+/// Precedence: `AI_MEMORY_HOME`, then `$HOME`, then Windows `%USERPROFILE%`,
+/// then the platform home from `dirs`. Empty strings are skipped so an
+/// exported-but-blank `HOME` cannot hide a real profile. Arguments are
+/// injected so tests do not mutate process env (`std::env::set_var` is
+/// `unsafe` under edition 2024).
+fn resolve_operator_home(
+    ai_memory_home: Option<&str>,
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    platform_home: Option<&Path>,
+) -> Option<String> {
+    [ai_memory_home, home, userprofile]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            platform_home
+                .and_then(Path::to_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        })
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -2402,17 +2493,57 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cli_dir = tmp.path().join("override");
         let cfg = Config::load(None, Some(cli_dir)).unwrap();
-        // `home_dir` is derived from AI_MEMORY_HOME or `$HOME` at load (the
-        // single config-read path), normalized so a trailing slash can't bypass
-        // the catch-all guards. Reading the env in a test is allowed; this
-        // fails if the load-time assignment is dropped while either env var is
-        // set.
+        // `home_dir` is derived from AI_MEMORY_HOME, `$HOME`, or Windows
+        // `%USERPROFILE%` at load (the single config-read path), normalized so
+        // a trailing slash can't bypass the catch-all guards. Reading the env
+        // in a test is allowed; this fails if the load-time assignment is
+        // dropped while any of those vars is set.
         assert_eq!(
             cfg.home_dir,
             std::env::var("AI_MEMORY_HOME")
                 .or_else(|_| std::env::var("HOME"))
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .and_then(|h| normalize_home_dir(&h))
+                .or_else(|| dirs::home_dir()
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .and_then(normalize_home_dir))
+        );
+    }
+
+    /// Native Windows often has `%USERPROFILE%` and no `$HOME`. The #103
+    /// catch-all guard is inert when `home_dir` stays `None`, so a project
+    /// whose `repo_path` is the user profile would prefix-match every cwd
+    /// beneath it.
+    #[test]
+    fn operator_home_falls_back_to_userprofile_when_home_is_unset() {
+        assert_eq!(
+            resolve_operator_home(None, None, Some(r"C:\Users\tester"), None).as_deref(),
+            Some(r"C:\Users\tester")
+        );
+        assert_eq!(
+            resolve_operator_home(
+                Some("/tmp/override"),
+                Some("/home/u"),
+                Some(r"C:\Users\tester"),
+                None
+            )
+            .as_deref(),
+            Some("/tmp/override")
+        );
+        assert_eq!(
+            resolve_operator_home(None, Some("/home/u"), Some(r"C:\Users\tester"), None).as_deref(),
+            Some("/home/u")
+        );
+        assert_eq!(
+            resolve_operator_home(None, Some(""), Some(r"C:\Users\tester"), None).as_deref(),
+            Some(r"C:\Users\tester")
+        );
+        let platform = PathBuf::from(r"C:\Users\from-dirs");
+        assert_eq!(
+            resolve_operator_home(None, None, None, Some(platform.as_path())).as_deref(),
+            Some(r"C:\Users\from-dirs")
         );
     }
 
@@ -3245,20 +3376,93 @@ mod tests {
         );
     }
 
+    /// #762: a credential absent from the invoking shell no longer fails
+    /// `load` — `ai-memory status` must work from a shell that does not hold
+    /// the server's keys — but it still fails closed wherever the chain is
+    /// actually needed: `serve` startup and chain construction.
     #[test]
-    fn load_rejects_a_missing_or_empty_api_key_env_value() {
-        let error = load_with_toml(
-            "[[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"m\"\n\
+    fn a_missing_api_key_env_value_defers_to_serve_and_the_chain() {
+        let config = load_with_toml(
+            "llm_provider = \"gemini\"\n\
+             [[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"m\"\n\
              api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648\"\n",
         )
-        .expect_err("an unresolved api_key_env must fail closed");
+        .expect("a CLI that never builds the chain must load without the credential");
+        let expected = "llm_fallbacks[0].api_key_env=AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648 is \
+                        set but the environment variable is missing or empty";
+
         assert!(
-            format!("{error:#}").contains(
-                "llm_fallbacks[0].api_key_env=AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648 is set but \
-                 the environment variable is missing or empty"
-            ),
+            config.llm_fallback_configs.is_empty(),
+            "an unresolved profile must never reach the chain"
+        );
+        let error = config
+            .require_llm_fallback_credentials()
+            .expect_err("serve startup must still fail closed");
+        assert_eq!(format!("{error:#}"), expected);
+        let error = config
+            .llm_provider_chain()
+            .err()
+            .expect("building the chain must fail rather than drop the fallback");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Deferring the credential must not defer the rest of the profile's
+    /// validation: a malformed profile still fails `load` for every command.
+    #[test]
+    fn a_missing_api_key_env_value_does_not_hide_a_malformed_profile() {
+        let error = load_with_toml(
+            "[[llm_fallbacks]]\nprovider = \"openai-compat\"\nmodel = \"m\"\n\
+             api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_762\"\n",
+        )
+        .expect_err("openai-compat needs a base_url whether or not the key is present");
+        assert!(
+            format!("{error:#}").contains("LLM_BASE_URL"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// The placeholder that validates a profile with an absent credential
+    /// must be accepted by every API-key provider's constructor. If one ever
+    /// checks key shape (a prefix, a length), a correct profile would fail
+    /// `load` over a key the operator never set — this pins that it does not.
+    #[test]
+    fn every_api_key_provider_accepts_the_unresolved_placeholder() {
+        for (provider, extra) in [
+            ("anthropic", ""),
+            ("openai", ""),
+            ("gemini", ""),
+            ("opencode", ""),
+            (
+                "openai-compat",
+                "base_url = \"https://openrouter.ai/api/v1\"\n",
+            ),
+        ] {
+            let config = load_with_toml(&format!(
+                "[[llm_fallbacks]]\nprovider = \"{provider}\"\nmodel = \"m\"\n{extra}\
+                 api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_762\"\n"
+            ))
+            .unwrap_or_else(|error| {
+                panic!("{provider}: load must defer the credential: {error:#}")
+            });
+            assert_eq!(
+                config.llm_fallback_unresolved.len(),
+                1,
+                "{provider}: the absent credential must be recorded"
+            );
+            assert!(
+                config.llm_fallback_configs.is_empty(),
+                "{provider}: the placeholder-built config must be discarded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_without_unresolved_fallbacks_passes_the_serve_check() {
+        let config = load_with_toml("").unwrap();
+        config.require_llm_fallback_credentials().unwrap();
     }
 
     #[test]
