@@ -45,3 +45,6 @@ evals/runs/
 *.bak-*
 evals/datasets/
 evals/models/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
