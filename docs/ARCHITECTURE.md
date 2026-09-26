@@ -252,6 +252,26 @@ and older clients cannot bypass it. The typed sanitizer boundary then applies a
 16 KiB backstop to every durable observation body after redaction. The
 separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 
+An optional RFC 3339 `occurred_at` on the hook body lets a client supply the
+event's own original time — currently only `ai-memory backfill`, replaying a
+transcript's per-event timestamps, so imported sessions/observations are
+stamped with when they actually happened instead of import time. It is read
+from the top level of the body only (unlike the nested `payload`/`event`/
+`properties`/`info`/`path` search other hook fields use), so a real harness
+payload that happens to carry an `occurred_at` key somewhere in its own
+structure is never mistaken for this field. It is numeric metadata, not text,
+so it never goes through the sanitizer (outside invariant #6's boundary); it
+is still client-controlled input over `/hook`, so
+`HookEnvelope::occurred_at_micros` bounds it (must be > 0 and no more than
+five minutes ahead of server time) before trusting it. Anything else —
+missing, unparsable, or out of bounds — resolves to `None`, which the store
+treats as "now", never an error, keeping hooks fire-and-forget (invariant #5).
+A backfilled session's `ended_at` can therefore land well in the past, which
+can push it below the auto-improve watermark and the experience-pass anchor
+(both keyed on `ended_at`), and a retention window measured from an
+observation's own time can make an old backfilled observation immediately
+prunable rather than only after it ages in place.
+
 ## Storage architecture
 
 **Two layers, one source of truth.**
@@ -668,17 +688,9 @@ per_user = false                  # shared + own slots in agent context
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000
-                                   # a flat chars-per-token heuristic, so it
-                                   # UNDER-budgets denser corpora: pt-BR prose
-                                   # and source code tokenize at fewer chars per
-                                   # token than English and can overshoot the
-                                   # provider's real limit by ~40% — lower this
-                                   # (or input_token_safety_margin) for such a corpus
 max_output_tokens = 32000          # provider generation limit; min 1000
                                    # their sum must fit the model context window;
                                    # leave headroom for tokenizer variance
-input_token_safety_margin = 0.8    # scales the char budget, (0.0, 1.0]; the
-                                   # 0.8 default buys pt-BR/code headroom
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

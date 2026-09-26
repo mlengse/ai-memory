@@ -7,26 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- `[consolidation] input_token_safety_margin` (float, default `0.8`, validated
-  to `(0.0, 1.0]`) scales the approximate char-count input budget. The
-  `max_input_tokens` budget uses a flat chars-per-token heuristic that
-  under-budgets denser corpora — pt-BR text and source code tokenize at fewer
-  chars per token than English and could overshoot a provider's real input
-  limit by ~40%. The default tightens the common case modestly while leaving
-  such corpora headroom; lower it further for a mostly non-English or code
-  corpus. `max_input_tokens` is now documented as an approximate heuristic in
-  the config reference. (#884)
-- `docs/jev-reranker-adapter.md` documents a stdlib-only adapter
-  (`docs/examples/jev-reranker-adapter/jev_rerank_shim.py`) that serves the
-  `AI_MEMORY_RERANKER=llm` request leg from a Jev `/v1/systemone` judge
-  endpoint while reverse-proxying consolidation/lint/bootstrap traffic to
-  the configured provider unchanged. In the contributor's own 102-query
-  golden-set benchmark the judge matched the hosted reranker's
-  hit@1/MRR/NDCG@10 (0.778/0.838/0.873 vs 0.778/0.840/0.875) at 0.205 s
-  mean latency instead of 20.2 s — in that run the hosted mean sat on the
-  server's 20 s completion timeout, which made the reranker stall every
-  query before falling back. (#873)
+## [2.4.1] - 2026-09-25
 
 ### Changed
 - Quieted the default server log: the reconciliation-pass summary that fired
@@ -36,8 +17,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server's log). Both are restorable through `log_level` (e.g.
   `"info,rmcp=info"` or `"debug"`) or `RUST_LOG`; the `tracing_appender=warn`
   feedback-loop guard stays non-overridable. (#894)
+- An unauthenticated non-loopback bind is now announced on stderr at startup
+  independent of the log filter (a direct `eprintln!`, not a filterable
+  `tracing` warning), so `RUST_LOG=error` or a container's quiet log no longer
+  hides it. The refuse path for a non-loopback unauthenticated host bind is
+  unchanged — this only makes the existing warning reliably visible. (#903)
 
 ### Fixed
+- OMP (OpenClaw) tool calls are recorded again. OMP was missing from the
+  closed-tool-agent set, so its tool events fell through the OpenCode-only
+  legacy body reader and produced an empty excerpt — nothing reached session
+  pages, handoffs, or consolidation. OMP now renders through the Pi tool
+  schema like the other closed-tool agents (only `output` is kept as the
+  excerpt; `args`/`details` stay excluded, still through the sanitizer). (#913)
+- A page whose `expires_at` is a bare date (`2026-10-01`) now gets an OKF
+  `stale_after` that names the instant the TTL expires it
+  (`2026-10-01T23:59:59.999999Z`) instead of the date copied verbatim. OKF
+  v0.2 requires every timestamp to carry an explicit UTC offset, and read a
+  bare date as the start of that day, a day earlier than ai-memory's
+  end-of-day TTL. An RFC 3339 `expires_at` is still carried unchanged.
+  Pages already written that way are repaired in place when `serve`
+  starts: index row and file, with the same version row, `updated_at`,
+  `generated.at` and body, in one wiki commit, and nothing to do on later
+  starts. (#917)
+- `ai-memory backfill` stamps each imported session and observation with the
+  transcript's own event time instead of the moment it was imported, so a
+  transcript from weeks ago no longer looks like it just happened. An event
+  without a valid timestamp inherits the nearest one, and the session's start
+  and end are the earliest and latest event times. The `/hook` body accepts a
+  top-level RFC 3339 `occurred_at`; it must be positive and no more than five
+  minutes in the future, and anything missing, malformed or out of bounds
+  falls back to "now" instead of failing the hook. Because an imported
+  session now ends in the past, it can sit below the auto-improve watermark
+  and the experience-pass anchor (no automatic review until a newer session
+  moves them), an opt-in observation retention window can prune its older
+  observations right after import, and the "most recently active project"
+  fallback after a restart may not pick a project that was just backfilled.
+  (#919)
+- The default log filter's `rmcp=warn` cap (#894) no longer raises rmcp
+  above a quieter `log_level`. A target directive beats the global level
+  either way, so with `log_level = "error"` or `"off"` the cap re-enabled the
+  SDK's warnings the operator had silenced; it now only applies when
+  `log_level` is louder than `warn`. (#896)
+- A session with no usable prompt is titled `Session <id>` rather than
+  `stop` or `session-end`. Once #895 skipped tool-family labels in the title
+  fallback, the next candidate in a real session was the kind name the router
+  stores for an untitled lifecycle event. (#897)
+- A wiki page with CRLF line endings is parsed as having frontmatter again.
+  `markdown::parse` only matched the fence lines with a bare `\n`, so a page
+  a Windows editor saved, or one `core.autocrlf=true` checked out, was treated
+  as body-only: `reindex`/the watcher indexed it without its `tier`,
+  `pinned`, `expires_at` and `entities` (a pinned page became decay-eligible),
+  the title came from the filename, and the one-shot OKF file pass wrote a
+  second frontmatter block above the authored one. The parser now accepts
+  `---\r\n` fences and leaves the body's line endings untouched. (#908)
+- Rule slugs that hit the 60-character cap keep every whole word that fits.
+  The word-boundary cut from #886 only looked for a hyphen before position 60,
+  so a slug whose first 60 characters ended exactly on a word dropped that
+  word, and a hyphen early in the title (a short first word before one long
+  token) collapsed the slug to that single word. The cut now counts a hyphen
+  at position 60 and ignores one in the first half, falling back to the hard
+  cut at 60. (#886, #910)
+- On Windows, `ai-memory run` recognises an OpenCode session as belonging
+  to the current checkout again. `native_session_in_checkout` (#880) compared
+  the stored `directory` with the backslash `cwd` exactly, while OpenCode
+  stores forward slashes (#891), so the check never matched there; it now uses
+  the same two spellings as the other OpenCode lookups (#882). (#906)
 - A manual `memory_consolidate` now reconciles the session's durable
   consolidation job row. The MCP handler wrote the page directly through the
   consolidator without touching `session_consolidation_jobs`, so a session
@@ -254,6 +299,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of `%C3%A9`. An accented cwd reached the server as a different
   path, and Cursor events and the session-start handoff lookup both use the
   query `cwd`. (#877)
+- Link extraction no longer mints a permanently unresolved row from a
+  directory target. A `relations:` value whose final component is empty
+  (`sessions/`) had the extension appended to nothing and was stored as the
+  literal `sessions/.md`; the same target in a body link or wikilink
+  (`[notes/](notes/)`) stayed extension-less. No page path can match either —
+  page paths carry `.md` and `latest_page_id_for_link` matches exactly — so
+  both sat in `links` with `to_page_id = NULL` and were visible only as
+  `unresolved:` in `ai-memory status`. Both routes now skip a directory
+  target, or a stem-less `.md`, with the existing warning. (#915)
 
 ## [2.4.0] - 2026-09-21
 
@@ -6497,7 +6551,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...HEAD
+[2.4.1]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.4.0
 [2.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.2
 [2.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.1

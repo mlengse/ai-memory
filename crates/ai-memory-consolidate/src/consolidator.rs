@@ -154,23 +154,9 @@ impl Consolidator {
     ///
     /// `max_input_tokens + max_output_tokens` must fit the provider's context
     /// window. Callers validate the supported minimums when resolving config.
-    ///
-    /// `safety_margin` shrinks the char-count input budget so the flat
-    /// chars-per-token heuristic does not over-admit on denser-than-English
-    /// corpora (pt-BR, code); it is validated to `0 < margin <= 1` at config
-    /// load. See [`DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`] (#884).
     #[must_use]
-    pub fn with_prompt_limits(
-        mut self,
-        max_input_tokens: usize,
-        max_output_tokens: u32,
-        safety_margin: f64,
-    ) -> Self {
-        self.budgets = PromptBudgets::from_limits_with_margin(
-            max_input_tokens,
-            max_output_tokens,
-            safety_margin,
-        );
+    pub fn with_prompt_limits(mut self, max_input_tokens: usize, max_output_tokens: u32) -> Self {
+        self.budgets = PromptBudgets::from_limits(max_input_tokens, max_output_tokens);
         self
     }
 
@@ -1151,17 +1137,6 @@ pub const DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 100_000;
 /// Default maximum generated tokens for a consolidation response.
 pub const DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
-/// Default multiplier applied to the char-count input budget (#884).
-///
-/// `max_input_tokens` is turned into a char budget with a flat
-/// [`CHARS_PER_TOKEN`] heuristic. That ratio holds for English prose but
-/// over-admits on denser corpora — pt-BR prose and source code tokenize at
-/// closer to ~2.1 chars/token, so a 3:1 estimate overshot the real token
-/// count by ~40% and tripped provider `max_input_tokens` limits. Shrinking
-/// the effective char budget to 80% of the nominal value buys that headroom
-/// back for the common case while leaving English budgets close to before.
-pub const DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN: f64 = 0.8;
-
 /// Conservative character-to-token estimate for provider-neutral budgeting.
 /// The exact tokenizer is provider/model-specific, so this is a target rather
 /// than a hard token count. Three characters per token plus the default
@@ -1215,26 +1190,8 @@ struct PromptBudgets {
 
 impl PromptBudgets {
     fn from_limits(max_input_tokens: usize, max_output_tokens: u32) -> Self {
-        // A bare limit applies no safety margin (margin 1.0), preserving the
-        // historical char budget; production tightens it via config (#884).
-        Self::from_limits_with_margin(max_input_tokens, max_output_tokens, 1.0)
-    }
-
-    /// Derive budgets from the token limits, shrinking the char-count input
-    /// budget by `safety_margin` (#884). The margin compensates for the flat
-    /// [`CHARS_PER_TOKEN`] heuristic over-admitting on denser-than-English
-    /// corpora (pt-BR, code). Callers pass a validated `0 < margin <= 1`.
-    fn from_limits_with_margin(
-        max_input_tokens: usize,
-        max_output_tokens: u32,
-        safety_margin: f64,
-    ) -> Self {
-        let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
-        // `safety_margin` is validated to `0 < margin <= 1` at config load, so
-        // the product never exceeds `nominal` and the cast cannot overflow.
-        let max_input_chars = (nominal as f64 * safety_margin) as usize;
         Self {
-            max_input_chars,
+            max_input_chars: max_input_tokens.saturating_mul(CHARS_PER_TOKEN),
             max_output_tokens,
         }
     }
@@ -1544,7 +1501,11 @@ fn slugify_for_rule(title: &str) -> String {
         // `out` is ASCII here, so byte index 60 is a char boundary. Cut at
         // the last hyphen inside the window to end on a whole word; only
         // hard-cut at 60 when the window holds no hyphen (one long token).
-        match out[..60].rfind('-') {
+        // The window includes index 60: a hyphen there means the first 60
+        // chars are whole words, and they all fit. A hyphen in the first
+        // half does not count, because cutting there would throw most of
+        // the title away (a short first word before one long token).
+        match out[..=60].rfind('-').filter(|&idx| idx >= 30) {
             Some(idx) => out.truncate(idx),
             None => out.truncate(60),
         }
@@ -1795,54 +1756,6 @@ mod tests {
         );
     }
 
-    /// #884: the safety margin scales the char budget by exactly the factor,
-    /// and margin 1.0 reproduces the un-margined budget.
-    #[test]
-    fn safety_margin_scales_input_char_budget() {
-        let full = PromptBudgets::from_limits(10_000, 1_000);
-        assert_eq!(full.max_input_chars, 30_000);
-        assert_eq!(
-            PromptBudgets::from_limits_with_margin(10_000, 1_000, 1.0),
-            full,
-            "margin 1.0 must leave the budget unchanged"
-        );
-        let tightened = PromptBudgets::from_limits_with_margin(10_000, 1_000, 0.8);
-        assert_eq!(
-            tightened.max_input_chars, 24_000,
-            "margin 0.8 must shrink the char budget to 0.8x"
-        );
-        // Output allowance is independent of the input margin.
-        assert_eq!(tightened.max_output_tokens, 1_000);
-    }
-
-    /// #884: a large observation set is packed to the tightened budget, so a
-    /// margin actually reduces how much prompt content is admitted.
-    #[test]
-    fn safety_margin_trims_packed_observations() {
-        let tightened = PromptBudgets::from_limits_with_margin(
-            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
-            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
-            0.8,
-        );
-        let full = PromptBudgets::from_limits(
-            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
-            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
-        );
-        assert!(tightened.max_input_chars < full.max_input_chars);
-        let observations = (0..256).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
-        let request = build_request(
-            SessionId::new(),
-            &observations,
-            &"x".repeat(50_000),
-            Some(&"preference ".repeat(500)),
-            tightened,
-        );
-        assert!(
-            estimated_input_chars::<ConsolidatedPage>(&request) <= tightened.max_input_chars,
-            "packed request must respect the tightened budget"
-        );
-    }
-
     /// The batch path must include schema and dynamic slot snapshots in its
     /// envelope instead of assuming a fixed number of slots.
     #[test]
@@ -1959,6 +1872,27 @@ mod tests {
     #[test]
     fn slugify_cjk_still_falls_back() {
         assert_eq!(slugify_for_rule("中文标题"), "rule");
+    }
+
+    /// A slug whose first 60 chars already end on a whole word keeps that
+    /// word: the hyphen right after it (index 60) is the boundary, and a
+    /// window that stops before it dropped the word (follow-up to #886).
+    #[test]
+    fn slugify_keeps_a_word_that_ends_exactly_at_the_cap() {
+        let title = ["abcd"; 11].join(" ") + " abcde more";
+        let slug = slugify_for_rule(&title);
+        assert_eq!(slug, ["abcd"; 11].join("-") + "-abcde");
+        assert_eq!(slug.len(), 60);
+    }
+
+    /// A boundary in the first half would throw most of the title away: a
+    /// short word before one long token must not collapse the slug to that
+    /// word, so the cut falls back to the hard 60 (follow-up to #886).
+    #[test]
+    fn slugify_does_not_collapse_to_a_short_first_word() {
+        let slug = slugify_for_rule(&format!("a {}", "b".repeat(70)));
+        assert_eq!(slug.len(), 60);
+        assert!(slug.starts_with("a-bbb"), "slug collapsed to {slug:?}");
     }
 
     fn update_with_summary(summary: Option<&str>) -> crate::types::ConsolidatedPageUpdate {
