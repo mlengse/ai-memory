@@ -6358,7 +6358,6 @@ mod tests {
                         title: format!("Page {idx}"),
                         snippet: format!("candidate {idx}"),
                         rank: idx as f64,
-                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },

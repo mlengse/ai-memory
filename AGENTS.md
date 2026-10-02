@@ -615,4 +615,3 @@ Additional boundary rules:
   agent-to-agent inbox/queue and the on-start hot-context notice.
 - [`docs/companion-crates.md`](docs/companion-crates.md) — boundary for
   optional companion projects (e.g. the importer).
-

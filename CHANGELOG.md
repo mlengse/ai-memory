@@ -1430,13 +1430,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checksum block, which concatenates every platform's file. The zip's smoke
   test now requires LF rather than tolerating either, so the format the
   release claims is the format it ships. (#838)
-- `memory_recent` no longer overloads the `rank` field with the page's
-  `updated_at` timestamp (µs), which made `rank` mean a relevance score in
-  `memory_query` and a raw timestamp in `memory_recent`. Recency listings now
-  report `rank` as the 0-based recency position and carry the timestamp in a new
-  `updated_at_us` field (`None`, and omitted from JSON, for search hits), so
-  `rank` means the same thing — a sort key, lower is better — across both tools
-  (F-006).
 - `purge-session` now removes every page version the session owns at
   `sessions/<id>.md` (including versions written before OKF sources existed
   and summaries of sessions that never recorded a summary pointer), while a
@@ -1897,6 +1890,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like an omitted one — the resolved project's latest completed session — and a
   malformed id now fails as `invalid params`, the code `memory_auto_improve`
   already uses for the same argument.
+
 - `backfill` returned success even when imports failed, and `--quiet` hid
   their diagnostics. It now reports errors on stderr, includes failure counts
   in the human summary, and exits nonzero after emitting its report (#786).
