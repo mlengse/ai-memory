@@ -592,8 +592,9 @@ Additional boundary rules:
 - [`docs/install.md`](docs/install.md) — installation cookbook for every
   supported agent client.
 - [`docs/cookbook.md`](docs/cookbook.md) — task-oriented cheat sheet: "I want
-  to do X" → how (recall, durable rules, importing a knowledge base, two agents
-  working together).
+  to do X" → how (recall, durable rules and must-read docs, importing a
+  knowledge base, retention, two agents working together, several accounts or
+  an external launcher via `run --env`, the Mac app, CLI, troubleshooting).
 - [`docs/comparison.md`](docs/comparison.md) — fair, user-facing comparison
   against other memory tools (camps, migration notes, how the field validates
   the file-first/pages-over-facts approach). Analysis behind it:
@@ -614,4 +615,3 @@ Additional boundary rules:
   agent-to-agent inbox/queue and the on-start hot-context notice.
 - [`docs/companion-crates.md`](docs/companion-crates.md) — boundary for
   optional companion projects (e.g. the importer).
-
