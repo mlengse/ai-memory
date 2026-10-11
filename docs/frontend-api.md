@@ -4,15 +4,15 @@
 > frontends against an `ai-memory` server. Added in **v0.6.0** (PR #7).
 > Everything below is sourced from the actual route handlers in
 > `crates/ai-memory-web/src/routes/api.rs` and the response structs in
-> `crates/ai-memory-store/src/reader.rs` — keep them as the canonical
+> `crates/ai-memory-store/src/reader.rs`. Treat those files as the canonical
 > reference if anything here drifts.
 
 ## 1. What this surface is (and isn't)
 
 | | What you can do | What you can't do |
 |---|---|---|
-| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
-| `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — use same-origin hosting or configure CORS deliberately (see §9). |
+| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
+| `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy. Use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
 
@@ -29,7 +29,7 @@
   Bearer fails closed rather than falling back. Before human auth activates,
   deprecated Basic/cookie compatibility is evaluated for GET requests; after
   activation, Basic and unknown schemes do not suppress a valid web session.
-- `/mcp`, hooks, handoffs, and workstream routes are machine-only. A web-session
+- `/mcp`, `/identity`, hooks, handoffs, and workstream routes are machine-only. A web-session
   cookie cannot authenticate them.
 - A disallowed `Host` header receives `403 Forbidden` before auth evaluation
   (DNS-rebinding guard).
@@ -68,6 +68,18 @@ deprecated GET-only browser compatibility may accept the root bearer through
 HTTP Basic and an HttpOnly `ai_memory_auth` cookie. Human activation disables
 that path immediately. See [`docs/users.md`](users.md) for bootstrap, password
 rotation, recovery, roles, session expiry, and API-key lifecycle.
+
+Machine clients can call `GET /identity` with their bearer key, even when the
+web UI is disabled. It reports only the authenticated caller and server version:
+
+```json
+{"version":"2.5.2","level":"user","operator":"user:alice","distinguishes_operators":true}
+```
+
+`level` is `root`, `user` or `anonymous`; `operator` is the qualified identity
+key, or `null` on an unauthenticated single-user server. Web-session cookies
+cannot authenticate this route. Its response uses `Cache-Control: private,
+no-store`. See [users.md](users.md) for machine keys and identity types.
 
 ## 3. Error model
 
@@ -190,7 +202,7 @@ on disk (the body is read from the markdown file at request time).
 
 ### 4.5 Search
 
-Two forms — query-string for the common single-scope or global case,
+Two forms: query-string for the common single-scope or global case, and a
 JSON body for multi-scope.
 
 ```http
@@ -238,7 +250,7 @@ Rules:
   top-level `workspace`/`project`.
 - `snippet` contains FTS5 HTML markers (`<mark>…</mark>`) around the
   matched terms.
-- `rank` is FTS5 rank — **lower is better** (closer to query terms).
+- `rank` is FTS5 rank; **lower is better** (closer to query terms).
 
 ### 4.6 Recent
 
@@ -255,7 +267,7 @@ Every reader surface uses the same `kind` contract. An explicit frontmatter
 `rule`, `slot`, `session`, `decision`, `gotcha`, `concept`, `procedure`, and
 `note`, respectively. Other paths fall back to `fact`.
 
-**Response:** a bare JSON array, `[BriefingPage, …]`
+**Legacy response:** a bare JSON array of `PageSummary` objects.
 
 ```json
 [
@@ -268,13 +280,37 @@ Every reader surface uses the same `kind` contract. An explicit frontmatter
 ]
 ```
 
+Supply `updated_since` (RFC 3339) or `cursor` to opt into incremental paging:
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/recent?updated_since=2026-09-30T00%3A00%3A00Z&limit=20
+```
+
+```json
+{"pages": [], "next_cursor": null}
+```
+
+The cutoff is exclusive (`updated_at > updated_since`). Results are ordered
+by `(updated_at, path)` ascending and fetched with a bounded SQL query. Pass
+`next_cursor` unchanged to continue; an optional cutoff must match the cursor's
+cutoff. Cursors use versioned URL-safe base64 without padding, are opaque to
+clients, and are limited to 8192 characters (6144 decoded bytes). They are bound
+to the workspace and project. Invalid, foreign-scope or conflicting cursors
+return 400. Each request rechecks authorization and uses
+`Cache-Control: private, no-store`.
+
+Incremental results omit superseded and expired pages, including expired pinned
+pages. They provide no snapshot or deletion feed: concurrent changes can appear
+on a later page, and deleted or expired pages are absent. Calls without either
+parameter retain the legacy array, descending order and cache behavior.
+
 ### 4.7 Briefing (structured snapshot)
 
 ```http
 GET /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=10
 ```
 
-Same payload `memory_briefing` returns — counts + activity windows +
+Same payload `memory_briefing` returns: counts + activity windows +
 last-observation + open handoffs + `_rules/` + `_slots/` + N most-recent
 pages. No LLM, deterministic.
 
@@ -314,7 +350,7 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?all_owners=true
 `state` accepts `open` | `accepted` | `expired`; omit it to list every state,
 which is how you find a baton that was already consumed. Results are scoped by
 owner: an authenticated caller sees their own plus the shared handoffs, an
-anonymous browser sees only shared ones — an owned handoff (and the prompt-
+anonymous browser sees only shared ones. An owned handoff (and the prompt-
 derived text inside it) is never rendered to someone it does not belong to.
 The same scoping applies to the `handoff` field of both overview endpoints and
 to `pending_handoff_count`, so the count and the fetch always agree.
@@ -322,8 +358,8 @@ For recovery, a root-authorized request may pass `all_owners=true` to list all
 operators' rows. User and anonymous requests receive `403`; the default remains
 own plus shared, including for root.
 
-On a server that authenticates, the listing's prompt-derived fields —
-`summary`, `open_questions`, `next_steps` — are served to a caller the server
+On a server that authenticates, the listing's prompt-derived fields
+(`summary`, `open_questions`, `next_steps`) are served to a caller the server
 can name and to the root operator; an automatic handoff synthesises them
 verbatim from the operator's prompts, and the listing returns the project's
 whole history rather than the single newest open row. A caller that is neither
@@ -338,7 +374,7 @@ one, otherwise the username. An ingress that terminates OIDC and forwards both
 `X-Memory-Actor-Issuer` and `X-Memory-Actor-Sub` therefore reads its own
 handoffs and the shared ones with `redacted: false`, and no rung of the auth
 chain produces an
-authenticated-but-unnameable caller today — the redacting arm is a fail-safe
+authenticated-but-unnameable caller today. The redacting arm is a fail-safe
 floor, not a live tier. `owner` / `accepted_by` carry the qualified storage key
 (`user:alice`, `oidc:<issuer-byte-length>:<issuer><subject>`).
 
@@ -401,7 +437,7 @@ either response, `handoff` is `null` when no open handoff matches the scope:
 }
 ```
 
-> Note: `handoff` is **not** consumed by the read API — the
+> Note: `handoff` is **not** consumed by the read API. The
 > handoff stays "open" and can still be accepted by the next agent.
 
 ### 4.9 Cross-project graph
@@ -441,8 +477,8 @@ GET /favicon.ico
 Returns the same transparent PNG the built-in web UI serves as the
 header logo. Browsers fetch this path automatically. The route is
 present whenever the web UI is enabled (`--enable-web`) and is
-mounted at the absolute host root — outside `--base-path` and outside
-the `/web` nest — so the browser's automatic fetch reaches it even
+mounted at the absolute host root, outside `--base-path` and outside
+the `/web` nest, so the browser's automatic fetch reaches it even
 under a subpath deployment. The response is `image/png` despite the
 `.ico` URL (modern browsers accept PNG icons), and the route is
 **exempt from authentication and host allowlist**: a fresh tab can fetch the
@@ -476,11 +512,18 @@ an unnamed caller sees unattributed ones only. Never cached (`no-store`).
       "started_at": "2026-08-16T09:12:03.412Z",
       "ended_at": "2026-08-16T10:47:55.001Z",
       "observation_count": 143,
-      "actor_user": null
+      "actor_user": null,
+      "consolidation": {"state": "completed", "attempts": 1}
     }
   ]
 }
 ```
+
+`consolidation` is `null` when no job exists for that session in the requested
+project. Otherwise it contains the latest generation's state (`pending`,
+`running`, `completed`, `failed` or `superseded`) and attempt count. Jobs are
+selected in the same scope and query as the owner-filtered sessions; provider
+errors are omitted. This reports the job state, not every page's freshness.
 
 ### 4.12 Session observations
 
@@ -516,7 +559,8 @@ historical text. Never cached (`no-store`). Same payload as the MCP tool
     "started_at": "2026-08-16T09:12:03.412Z",
     "ended_at": "2026-08-16T10:47:55.001Z",
     "observation_count": 143,
-    "actor_user": null
+    "actor_user": null,
+    "consolidation": null
   },
   "observations": [
     {
@@ -561,6 +605,18 @@ historical text. Never cached (`no-store`). Same payload as the MCP tool
   request body affects the result.
 
 ## 6. Custom UI hosting and base paths
+
+For an API-only companion, mount the protected JSON surface without a browser
+UI:
+
+```bash
+ai-memory serve --transport http --enable-api
+```
+
+`--enable-web` continues to imply `/api/v1` for compatibility. `--enable-api`
+alone does not mount `/web`, its login pages, static assets, or the unauthenticated
+favicon route. The API uses the same machine Bearer or browser-session auth gate
+in either mode.
 
 ```bash
 ai-memory serve \
@@ -612,8 +668,8 @@ characters (`[A-Za-z0-9-._~]`). Three things collapse the prefix to
 downgrade in the log:
 
 - `.` or `..` segments. Their characters are unreserved on their own,
-  but at the segment boundary they mean "current" and "parent" — one
-  typo and your prefix is a traversal vector.
+  but at the segment boundary they mean "current" and "parent", so a
+  single typo would turn your prefix into a traversal vector.
 - Any character outside the unreserved set (spaces, `<`, `"`, etc.).
 - Empty / whitespace-only input.
 
@@ -623,7 +679,7 @@ client-side and never reach the server.
 
 When `--web-ui-dir` is **absent**, the built-in server-side `/web`
 browser is the default (read-only HTML rendering, FTS5 search,
-project tree). No regression.
+project tree), unchanged from before.
 
 ## 7. Worked example: minimal SPA fetch
 
@@ -720,7 +776,7 @@ Read these:
 ## 9. CORS
 
 `/api/v1` accepts cross-origin requests when the operator configures
-the allow-list. The CORS layer is scoped to that router only — `/mcp`,
+the allow-list. The CORS layer is scoped to that router only; `/mcp`,
 `/hook`, `/admin/*`, and `/web` stay same-origin.
 
 Configure via either `--cors-allow-origin <origin>` (repeatable) on
@@ -738,7 +794,7 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 
 ## 10. Known gaps and deliberate non-goals
 
-- **No write surface, by design — not a pending iteration.** Browsers
+- **No write surface, by design.** This is not a pending iteration: browsers
   can't mutate, and won't. The wiki is a record of what a project
   produced, authored by automated summarisation over captured
   observations; retrieval, provenance and the audit trail all rest on
@@ -747,12 +803,12 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
   "what did someone want it to say", with no way to tell the two apart
   afterwards.
 
-  This is not a ban on human input. `memory_write_page` exists for
+  Human input is still allowed. `memory_write_page` exists for
   durable human annotations and lands them in the same lineage as
   everything else (pages supersede on body change). The line is between
   adding to the record through the normal path and editing it from
   outside. A human-editable wiki is a reasonable thing to want and a
-  separate product — see #482.
+  separate product; see #482.
 - **Rate limiting** is shared with `/mcp` + `/admin` (only the body
   cap is enforced today). A future global limiter would tighten the
   authenticated-misbehaviour case.

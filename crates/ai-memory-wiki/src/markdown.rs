@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use ai_memory_core::{LinkTarget, PagePath};
+use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, LinkTarget, PagePath};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WikiResult;
@@ -167,8 +167,10 @@ impl CodeFence {
 /// Extract internal wiki links from a markdown body.
 ///
 /// Supports `[[wiki links]]`, `[[wiki links|labels]]`, cross-project
-/// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, and
-/// ordinary markdown links such as `[label](../decisions/foo.md#anchor)`.
+/// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, the reserved
+/// `[[_global:path]]` form (always the `_global` project in the default
+/// workspace), and ordinary markdown links such as
+/// `[label](../decisions/foo.md#anchor)`.
 /// External URLs, anchors, images, and non-markdown assets are ignored, and
 /// so is anything inside a fenced block or an inline code span, which the
 /// page shows as code rather than as a link.
@@ -338,13 +340,7 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
             continue;
         };
         for target in list.iter().filter_map(|v| v.as_str()) {
-            let (workspace, project, raw_path) = match target.split_once(':') {
-                None => (None, None, target),
-                Some((scope, path)) => match scope.split_once('/') {
-                    None => (None, Some(scope.to_string()), path),
-                    Some((ws, proj)) => (Some(ws.to_string()), Some(proj.to_string()), path),
-                },
-            };
+            let (workspace, project, raw_path) = split_scope(target);
             // Same terminal normalization as wikilinks: extension-less
             // targets gain `.md`; a directory target, a stem-less `.md`, and
             // anything with a non-md extension are not pages and are skipped.
@@ -380,13 +376,20 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
 /// of a wikilink target. Returns `(workspace, project, path_part)`. URL and
 /// scheme-prefixed targets carry no scope (the `:` belongs to the scheme);
 /// [`normalize_link_target`] rejects those downstream.
+///
+/// `[[_global:path]]` is a project-only qualifier, but the reserved
+/// preferences project lives in [`DEFAULT_WORKSPACE_NAME`], not in the
+/// source page's workspace (issue #1042). An explicit
+/// `[[workspace/_global:path]]` keeps the named workspace.
 fn split_scope(target: &str) -> LinkKey {
     let lower = target.to_ascii_lowercase();
     if target.contains("://")
         || lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return (None, None, target.to_string());
     }
@@ -397,11 +400,14 @@ fn split_scope(target: &str) -> LinkKey {
                 .chars()
                 .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
         if scope_ok {
-            let (workspace, project) = match scope.split_once('/') {
+            let (mut workspace, project) = match scope.split_once('/') {
                 Some((ws, proj)) => (Some(ws.trim().to_string()), proj.trim()),
                 None => (None, scope),
             };
             if !project.is_empty() {
+                if workspace.is_none() && project == GLOBAL_SCOPE_PROJECT {
+                    workspace = Some(DEFAULT_WORKSPACE_NAME.to_string());
+                }
                 return (
                     workspace,
                     Some(project.to_string()),
@@ -528,7 +534,13 @@ fn resolve_local_wikilink(
         .map_or((raw, None), |(t, l)| (t, Some(l)));
     let target_part = target_part.trim();
     let (workspace, project, path_part) = split_scope(target_part);
-    if workspace.is_some() {
+    // `split_scope` pins `[[_global:path]]` to the default workspace. When
+    // we are exporting that same reserved project, the target is still a
+    // local page even though the workspace is now explicit.
+    let exporting_global_home = own_project == GLOBAL_SCOPE_PROJECT
+        && project.as_deref() == Some(GLOBAL_SCOPE_PROJECT)
+        && workspace.as_deref() == Some(DEFAULT_WORKSPACE_NAME);
+    if workspace.is_some() && !exporting_global_home {
         return None; // no cross-workspace Markdown equivalent
     }
     if let Some(project) = &project
@@ -541,14 +553,20 @@ fn resolve_local_wikilink(
     // source page — `page_path` is unused on this branch of
     // `normalize_link_target`/`resolve_relative`), `.md` appended,
     // traversal collapsed.
-    let target = normalize_link_target(&path_part, page_path, true)?;
+    // Split off a trailing #anchor/?query so it survives the rewrite.
+    let (clean_path, suffix) = match path_part.find(['#', '?']) {
+        Some(i) => (&path_part[..i], &path_part[i..]),
+        None => (path_part.as_str(), ""),
+    };
+    let target = normalize_link_target(clean_path, page_path, true)?;
     let page_dir: Vec<&str> = page_path
         .as_str()
         .rsplit_once('/')
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let href = relative_href(&page_dir, &target);
+    let mut href = relative_href(&page_dir, &target);
+    href.push_str(suffix);
     let display = label.map_or(target_part, str::trim).to_string();
     Some((href, display))
 }
@@ -769,7 +787,9 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
     if lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return None;
     }
@@ -906,6 +926,30 @@ mod tests {
     }
 
     #[test]
+    fn extract_relation_links_global_target_pins_default_workspace() {
+        let fm = serde_json::json!({
+            "relations": {
+                "fixes": ["_global:python-env"],
+                "contradicts": ["other/_global:notes/x.md"],
+            }
+        });
+        let links = extract_relation_links(&fm);
+        let fixes = links
+            .iter()
+            .find(|l| l.relation == Some(ai_memory_core::Relation::Fixes))
+            .unwrap();
+        assert_eq!(fixes.workspace.as_deref(), Some(DEFAULT_WORKSPACE_NAME));
+        assert_eq!(fixes.project.as_deref(), Some(GLOBAL_SCOPE_PROJECT));
+        assert_eq!(fixes.path.as_str(), "python-env.md");
+        let contra = links
+            .iter()
+            .find(|l| l.relation == Some(ai_memory_core::Relation::Contradicts))
+            .unwrap();
+        assert_eq!(contra.workspace.as_deref(), Some("other"));
+        assert_eq!(contra.project.as_deref(), Some(GLOBAL_SCOPE_PROJECT));
+    }
+
+    #[test]
     fn unknown_relation_keys_and_bad_targets_are_skipped() {
         let fm = serde_json::json!({
             "relations": {
@@ -983,11 +1027,78 @@ mod tests {
         assert_eq!(l.path.as_str(), "decisions/adr-1.md");
     }
 
+    /// `[[_global:path]]` is a project-only qualifier, but the reserved
+    /// preferences project lives in the default workspace (#1042). Pinning
+    /// the workspace here is what lets a page outside `default` resolve.
+    #[test]
+    fn extract_links_global_wikilink_pins_default_workspace() {
+        let links = extract_links(
+            "see [[_global:python-env]] and [[_global:local-machine.md|env]]",
+            &page(),
+        );
+        let pinned: Vec<_> = links
+            .iter()
+            .filter(|l| l.project.as_deref() == Some(GLOBAL_SCOPE_PROJECT))
+            .collect();
+        assert_eq!(pinned.len(), 2, "{links:?}");
+        assert!(
+            pinned
+                .iter()
+                .all(|l| l.workspace.as_deref() == Some(DEFAULT_WORKSPACE_NAME)),
+            "project-only _global must name the default workspace: {links:?}"
+        );
+        assert!(pinned.iter().any(|l| l.path.as_str() == "python-env.md"));
+        assert!(pinned.iter().any(|l| l.path.as_str() == "local-machine.md"));
+
+        let sibling = extract_links("[[infra:runbooks/02.md]]", &page());
+        let l = sibling
+            .iter()
+            .find(|l| l.is_cross_project())
+            .expect("infra");
+        assert_eq!(
+            l.workspace, None,
+            "non-global project-only stays source-workspace"
+        );
+        assert_eq!(l.project.as_deref(), Some("infra"));
+
+        let explicit = extract_links("[[other/_global:notes/x.md]]", &page());
+        let l = explicit
+            .iter()
+            .find(|l| l.is_cross_project())
+            .expect("explicit");
+        assert_eq!(
+            l.workspace.as_deref(),
+            Some("other"),
+            "an explicit workspace is kept"
+        );
+        assert_eq!(l.project.as_deref(), Some(GLOBAL_SCOPE_PROJECT));
+    }
+
     #[test]
     fn extract_links_url_wikilink_is_not_a_scope() {
         // `https://...` must not be parsed as project "https".
         let links = extract_links("[[https://example.com]] [[mailto:a@b.com]]", &page());
         assert!(links.is_empty(), "URLs/schemes are not links: {links:?}");
+    }
+
+    #[test]
+    fn extract_links_file_and_vbscript_schemes_are_not_scopes() {
+        // `/web` already leaves these literal. Without the same prefixes
+        // here, `[[file:notes/x.md]]` peels `file` as a project scope and
+        // indexes a cross-project edge no page write can satisfy.
+        let links = extract_links(
+            "[[file:notes/x.md]] [[vbscript:msgbox]] [[file:///etc/passwd]]",
+            &page(),
+        );
+        assert!(
+            links.is_empty(),
+            "file/vbscript schemes are not wiki links: {links:?}"
+        );
+        let md = extract_links("[x](file:notes/x.md) [y](vbscript:msgbox)", &page());
+        assert!(
+            md.is_empty(),
+            "file/vbscript markdown destinations are not wiki links: {md:?}"
+        );
     }
 
     #[test]
@@ -1206,6 +1317,27 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_local_wikilinks_preserves_anchor_and_query_fragments() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("See [[decisions/b.md#context]].", &path, "proj"),
+            "See [decisions/b.md#context](../decisions/b.md#context)."
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#context|the decision]]", &path, "proj"),
+            "[the decision](../decisions/b.md#context)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b.md?v=1#part-2]]", &path, "proj"),
+            "[decisions/b.md?v=1#part-2](../decisions/b.md?v=1#part-2)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#my section|My Section]]", &path, "proj"),
+            "[My Section](<../decisions/b.md#my section>)"
+        );
+    }
+
+    #[test]
     fn rewrite_local_wikilinks_leaves_cross_project_untouched() {
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
@@ -1215,6 +1347,27 @@ mod tests {
         assert_eq!(
             rewrite_local_wikilinks("[[ws/other-project:decisions/b.md]]", &path, "proj"),
             "[[ws/other-project:decisions/b.md]]"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[_global:python-env.md]]", &path, "proj"),
+            "[[_global:python-env.md]]"
+        );
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_resolves_global_when_exporting_global() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("[[_global:python-env.md]]", &path, GLOBAL_SCOPE_PROJECT),
+            "[_global:python-env.md](../python-env.md)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks(
+                "[[default/_global:python-env.md]]",
+                &path,
+                GLOBAL_SCOPE_PROJECT,
+            ),
+            "[default/_global:python-env.md](../python-env.md)"
         );
     }
 

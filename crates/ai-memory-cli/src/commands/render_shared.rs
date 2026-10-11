@@ -77,6 +77,30 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// GitHub Copilot CLI's lifecycle events, configured with PascalCase event
+/// names so the payload comes in the Claude Code/VS-Code-compatible shape
+/// (`session_id`, `cwd`, `tool_name`, `tool_input`, `tool_result`) instead of
+/// its native camelCase one — this lets it free-ride on the same key-based
+/// payload extraction as Claude Code/Codex/Zcode (see `tool_observation_metadata`
+/// in `capture_policy.rs`) rather than needing a dedicated parser (#1040).
+/// Same vocabulary as `KIMI_CODE_EVENTS`: Claude Code's 9 events plus
+/// `PostToolUseFailure`, which Copilot (per
+/// <https://docs.github.com/en/copilot/reference/hooks-configuration>) fires
+/// instead of `PostToolUse` when a tool call errors — the server already
+/// aliases it to `PostToolUse` (`HookEvent::parse`), so it reuses that script.
+pub(crate) const COPILOT_CLI_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
 /// Kiro CLI v2-engine lifecycle events. Each pair is
 /// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
 ///
@@ -309,12 +333,12 @@ function captureShellCommand(args: Record<string, unknown> | undefined): string 
 // Split only when a policy is active: this runs for every tool event.
 function captureShellWordList(command: string | string[]): string[] { if (typeof command === "string") return captureShellWords(command); return command.flatMap((item) => { const tokens = captureShellWords(item); return tokens.length === 1 && tokens[0] === item || [...item].length > 256 ? tokens : [item, ...tokens]; }); }
 function captureShellWords(command: string): string[] { const special = (c: string) => /\s/.test(c) || "|&;<>()".includes(c); const chars = [...command]; const words: string[] = []; let word = ""; let inWord = false; let quote = ""; for (let i = 0; i < chars.length; i++) { const c = chars[i]; const next = chars[i + 1]; if (quote) { if (c === quote) quote = ""; else if (quote === '"' && c === "\\" && (next === '"' || next === "\\")) { word += next; i++; } else word += c; } else if (c === "'" || c === '"') { quote = c; inWord = true; } else if (c === "\\" && next !== undefined && (special(next) || next === "'" || next === '"' || next === "\\")) { word += next; i++; inWord = true; } else if (special(c)) { if (inWord) words.push(word); word = ""; inWord = false; } else { word += c; inWord = true; } } if (inWord) words.push(word); return words; }
-function captureShellArguments(word: string): string[] { const out = word.startsWith("-") ? [] : [word]; const eq = word.indexOf("="); if (eq >= 0) out.push(word.slice(eq + 1)); return out.filter((argument) => argument.trim() !== ""); }
+function captureShellArguments(word: string): string[] { const flag = word.startsWith("-"); const out = flag ? [] : [word]; const eq = word.indexOf("="); const colon = flag && eq < 0 ? word.indexOf(":") : -1; if (eq >= 0) out.push(word.slice(eq + 1)); else if (colon >= 0) out.push(word.slice(colon + 1)); return out.filter((argument) => argument.trim() !== ""); }
 // Lexical only, like the native hook: nothing is expanded or executed, so
 // variables, command substitution, and `cd` state are not followed. A tool's
 // own `workdir` replaces the event cwd for relative arguments.
 function captureMatchCommand(command: string | string[], config: CaptureConfig, workdir?: string): boolean | undefined { const budget = { work: 0 }; const home = homedir(); const base = workdir === undefined ? config.base : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(workdir) ? workdir : config.base && captureJoin(config.base, workdir); for (const word of captureShellWordList(command)) for (const argument of captureShellArguments(word)) { const expanded = argument.startsWith("~/") ? captureJoin(home, argument.slice(2)) : argument; if ([...expanded].length > CAPTURE_MAX_PATH_CHARS) continue; const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(expanded); if (!absolute && !base) continue; const candidate = captureNormalize(absolute ? expanded : captureJoin(base, expanded), config.windowsHost); if (!candidate) continue; const glob = /[*?]/.test(candidate.path); for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const under = captureStartsWith(candidate.path, pattern.prefix, pattern.windows); if (!under && !glob) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, pattern.windows, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobReaches(candidate.path, pattern.prefix, pattern.windows, budget); if (reaches !== false) return reaches; } } } return false; }
-function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir","list_dir","grep_search","search_files","find_by_name"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","search_web","manage_task","manage_subagents","terminal","execute_bash","execute_cmd"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
+function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir","list_dir","grep_search","search_files","find_by_name"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","search_web","manage_task","manage_subagents","terminal","execute_bash","execute_cmd","powershell"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
 // An external lifecycle owner (`AI_MEMORY_CAPTURE_OWNER`, any value that is
 // non-empty after trimming) takes over capture for this process: the gate runs
 // before the capture-policy marker scan, so no disposition work, no marker read
@@ -875,6 +899,14 @@ pub(crate) enum HookShape {
     /// `hooks.json` also requires a sibling `version: 1` key at
     /// the top level — handled by the caller's apply path.
     Flat,
+    /// GitHub Copilot CLI: `"E": [ { "type":"command", "command":"..." } ]`.
+    /// Entries sit directly in the event array like Cursor's, but with no
+    /// `matcher`: Copilot rejects it on `sessionStart`/`sessionEnd`/
+    /// `userPromptSubmitted`/`agentStop`/`subagentStop`/`errorOccurred` and
+    /// treats it as an optional filter elsewhere, so omitting it everywhere
+    /// means "fire on every invocation". The file's top-level `version: 1` is
+    /// handled by the caller's apply path, as for Cursor.
+    FlatWithoutMatcher,
 }
 
 /// One hook profile = (event vocabulary, JSON shape). Each agent
@@ -961,6 +993,13 @@ pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
 pub(crate) const COMMAND_CODE_PROFILE: HookProfile = HookProfile {
     events: &COMMAND_CODE_EVENTS,
     shape: HookShape::NestedWithoutMatcher,
+};
+/// Copilot keeps its flat entry shape even with PascalCase event names — only
+/// the payload sent to the script switches to snake_case — so this is
+/// `FlatWithoutMatcher`, not Claude's `Nested` (see the variant's doc).
+pub(crate) const COPILOT_CLI_PROFILE: HookProfile = HookProfile {
+    events: &COPILOT_CLI_EVENTS,
+    shape: HookShape::FlatWithoutMatcher,
 };
 pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
     events: &CURSOR_EVENTS,
@@ -1500,6 +1539,7 @@ fn build_hook_payload_for_platform(
                 "hooks": [handler],
             }]),
             HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
+            HookShape::FlatWithoutMatcher => Value::Array(vec![handler]),
         };
         hooks_block.insert((*event).to_string(), entry);
     }
@@ -2137,6 +2177,14 @@ function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): v
   }
 }
 
+// A 5xx, or one of the 4xx a saturated or momentarily unwilling server answers
+// with (408, 425, 429), asks for a retry: the event is fine and a later attempt
+// can land it. Any other 4xx rejects the event for good. The shell, PowerShell
+// and native drains classify the same way.
+function hookStatusRetryable(status: number): boolean {
+  return status >= 500 || status === 408 || status === 425 || status === 429;
+}
+
 let spoolDrainPromise: Promise<void> | undefined;
 
 function requestSpoolDrain(): void {
@@ -2173,11 +2221,11 @@ async function drainHookSpool(): Promise<void> {
         signal: timeoutSignal(2000),
       }).catch(() => undefined);
       if (!resp) return; // still unreachable; stop, keep the backlog
-      if (resp.ok || (resp.status >= 400 && resp.status < 500)) {
+      if (resp.ok || (resp.status >= 400 && resp.status < 500 && !hookStatusRetryable(resp.status))) {
         // Delivered, or permanently rejected - either way, done with it.
         try { unlinkSync(file); } catch (_e) {}
       } else {
-        return; // 5xx: server unhappy; retry a later drain
+        return; // 5xx or a transient 4xx: server unhappy; retry a later drain
       }
     } catch (_e) {
       return;
@@ -2240,6 +2288,16 @@ pub(crate) fn assert_shared_ts_delivery_runtime(name: &str, source: &str) {
     assert!(
         source.contains("anyFactory([hookAbort.signal, factory(ms)])"),
         "{name}: request deadlines must also honour hookAbort"
+    );
+    assert!(
+        source.contains(
+            "return status >= 500 || status === 408 || status === 425 || status === 429;"
+        ),
+        "{name}: a transient 4xx must stay retryable like a 5xx"
+    );
+    assert!(
+        source.contains("resp.status < 500 && !hookStatusRetryable(resp.status)"),
+        "{name}: the drain must keep an entry the server only asked to retry"
     );
 }
 
@@ -2851,6 +2909,38 @@ if (inheritOnly) {
     /// outer level — which made Claude Code refuse to load
     /// settings.json with "hooks: Expected array, but received
     /// undefined" on every event.
+    /// Copilot CLI keeps its flat entry shape even when the event names are
+    /// PascalCase (only the payload sent to the script changes), and rejects
+    /// `matcher` on session/stop/subagent events — so every entry must be a
+    /// bare `{type, command}` handler: no nested `hooks`, no `matcher`.
+    #[test]
+    fn copilot_cli_payload_uses_flat_entries_without_matcher() {
+        let root = PathBuf::from("/host/hooks/copilot-cli");
+        let v = build_posix_hook_payload(
+            COPILOT_CLI_PROFILE.events,
+            &root,
+            "http://localhost:49374",
+            None,
+            COPILOT_CLI_PROFILE.shape,
+        );
+        let hooks = v.pointer("/hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), COPILOT_CLI_EVENTS.len());
+        for (event, _) in COPILOT_CLI_EVENTS {
+            let entry = v
+                .pointer(&format!("/hooks/{event}/0"))
+                .and_then(|e| e.as_object())
+                .unwrap_or_else(|| panic!("missing /hooks/{event}/0"));
+            assert_eq!(
+                entry.get("type").and_then(|t| t.as_str()),
+                Some("command"),
+                "{event}"
+            );
+            assert!(entry.contains_key("command"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("hooks"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("matcher"), "{event}: {entry:?}");
+        }
+    }
+
     #[test]
     fn cursor_payload_uses_flat_shape() {
         // Flat shape: no inner `hooks: [...]` array; each event
@@ -3267,7 +3357,9 @@ if (inheritOnly) {
                 HookShape::Nested | HookShape::NestedWithoutMatcher => {
                     v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone()
                 }
-                HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
+                HookShape::Flat | HookShape::FlatWithoutMatcher => {
+                    v.pointer("/hooks/SessionStart/0").unwrap().clone()
+                }
             }
         }
 
@@ -3313,6 +3405,7 @@ if (inheritOnly) {
             ("antigravity-cli", HookShape::Flat),
             ("grok", HookShape::Nested),
             ("devin", HookShape::Nested),
+            ("copilot-cli", HookShape::FlatWithoutMatcher),
         ] {
             let handler = handler_for(HookCommandPlatform::WindowsNative, agent, shape);
             assert!(
