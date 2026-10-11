@@ -1,6 +1,6 @@
 # Security
 
-> The full security model. Moved verbatim from the README front page; the README keeps a summary.
+> The full security model. Moved from the README front page; the README keeps a summary.
 
 Loopback-only (`127.0.0.1:49374`) with no auth is the default because
 it is safe for a single-user laptop: no process outside the machine can
@@ -10,9 +10,9 @@ Unauthenticated non-loopback HTTP now fails closed. Set
 `AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
 intentional, dangerous exception for plain HTTP only. Authentication does not
 encrypt bearer tokens: for LAN or remote access, use the ready
-[Caddy](docker/compose.tls.caddy.yml) or
-[Cloudflare Tunnel](docker/compose.tls.cloudflared.yml) templates described in
-the [HTTPS reverse-proxy guide](docs/https-via-proxy.md).
+[Caddy](../docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](../docker/compose.tls.cloudflared.yml) templates described in
+the [HTTPS reverse-proxy guide](https-via-proxy.md).
 
 Enable bearer auth when the server is exposed beyond loopback, when
 untrusted local processes share the machine, or when the data dir holds
@@ -34,6 +34,15 @@ ai-memory install-mcp   --client claude-code --apply \
 ai-memory install-hooks --agent  claude-code --apply \
     --server-url "http://<server-ip>:49374" --auth-token "$TOKEN"
 ```
+
+When users must not see each other's projects at all, run separate servers.
+One machine can still capture for several of them: register each server as
+a named profile with `ai-memory server add` and let each repository's
+`.ai-memory.toml` select one with `server = "<name>"`. The marker never holds
+a URL or token, a profile can be restricted to the directories it serves, and
+a selection that does not resolve drops the event instead of sending it to
+another server. See
+[`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 
 Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/workstream/*`, and
 machine calls to `/admin/*` and `/api/v1/*`. Humans sign in at
@@ -79,24 +88,23 @@ sessions. Shared servers that rely on `[auto_scope]` session isolation still
 need explicit `workspace` + `project` / `scopes`, or a bridge that forwards the
 real lifecycle-hook session id on MCP requests.
 
-**Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
-the right answer is a battle-tested reverse proxy in front of it.
-[`docs/https-via-proxy.md`](docs/https-via-proxy.md) is the deployment
+**HTTPS.** ai-memory deliberately does not terminate TLS itself; put a
+well-tested reverse proxy in front of it.
+[`docs/https-via-proxy.md`](https-via-proxy.md) is the deployment
 guide, with copy-paste docker compose templates in
-[`docker/compose.tls.caddy.yml`](docker/compose.tls.caddy.yml) (Caddy
+[`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) (Caddy
 with Let's Encrypt or internal CA) and
-[`docker/compose.tls.cloudflared.yml`](docker/compose.tls.cloudflared.yml)
-(Cloudflare Tunnel — no open ports). Both are recommended once you
-turn on multi-user or bind beyond loopback. The Quick Start happy
-path of single-user on loopback doesn't need TLS — that case is
-called out explicitly in the guide so you don't add ceremony where
-it doesn't earn its keep.
+[`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml)
+(Cloudflare Tunnel, no open ports). Both are recommended once you
+turn on multi-user or bind beyond loopback. The Quick Start default
+of single-user on loopback doesn't need TLS; the guide says so
+explicitly so you don't add setup you don't need.
 
 **Multi-user attribution (v0.8, optional) plus human login.** When more
 than one human shares a server, ai-memory attributes each write to a
 named user. Humans sign in with username/password; agents and CLIs use
 `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN` for root automation, or
-an `aim_` key from `ai-memory api-key add`). Data stays single-tenant —
+an `aim_` key from `ai-memory api-key add`). Data stays single-tenant:
 there is no per-page RBAC. A
 `[auth].token_pepper` is required for DB-user authentication, but creating the
 first user row is what immediately switches every `/admin/*` endpoint to
@@ -106,8 +114,8 @@ single-user behavior until a user is added. An SSO gateway can instead use a
 dedicated `[auth].actor_proxy_bearer_token` and trusted `X-Memory-Actor-*`
 headers; its credential is deliberately separate from the root bearer so a
 missing identity cannot become root. See
-[`docs/users.md`](docs/users.md) for the full walkthrough and the
+[`docs/users.md`](users.md) for the full walkthrough and the
 four-rung auth ladder.
 
-See [`docs/deploy.md`](docs/deploy.md) for the full homelab pattern
+See [`docs/deploy.md`](deploy.md) for the full homelab pattern
 with bearer auth, host allowlisting, and TLS/reverse-proxy options.

@@ -178,6 +178,77 @@ async fn smoke_page_view_returns_200() {
     assert!(text.contains("Hello world"), "expected rendered body");
 }
 
+#[tokio::test]
+async fn page_view_keeps_a_leading_h1_that_is_not_the_title() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    // A frontmatter title wins the header, so an H1 that says something
+    // else is the only place the page says it.
+    let mut titled = wiki_req(
+        ws,
+        proj,
+        "decisions/auth.md",
+        "# Token refresh after sleep\n\nRefresh on wake.",
+    );
+    titled.frontmatter = serde_json::json!({"kind": "decision", "title": "Auth decisions"});
+    wiki.write_page(titled).await.unwrap();
+    // The title falls back to the path stem, since only an ATX `# ` line
+    // names a page, so a setext H1 is not a repeat of it either.
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "notes/setext.md",
+        "Cache warmup\n============\n\nWarm on boot.",
+    ))
+    .await
+    .unwrap();
+    // An H1 that is the title is still dropped, or the header repeats.
+    wiki.write_page(wiki_req(ws, proj, "notes/same.md", "# Same title\n\nBody."))
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+    };
+
+    let text = get("/w/default/scratch/p/decisions/auth.md").await;
+    assert!(text.contains("Auth decisions"), "expected the title");
+    assert!(
+        text.contains(r#"<h1 id="token-refresh-after-sleep">Token refresh after sleep</h1>"#),
+        "an H1 unlike the title was dropped: {text}"
+    );
+    let text = get("/w/default/scratch/p/notes/setext.md").await;
+    assert!(
+        text.contains(r#"<h1 id="cache-warmup">Cache warmup</h1>"#),
+        "a setext H1 unlike the title was dropped: {text}"
+    );
+    let text = get("/w/default/scratch/p/notes/same.md").await;
+    assert!(
+        !text.contains("<h1>Same title</h1>")
+            && !text.contains(r#"<h1 id="same-title">Same title</h1>"#),
+        "an H1 that repeats the title should not render twice: {text}"
+    );
+}
+
 // ── /web HTML chrome for multi-user attribution ──────────────────────
 
 #[tokio::test]
@@ -1087,6 +1158,7 @@ async fn seed_session(
     store
         .writer
         .begin_session(ai_memory_core::NewSession {
+            occurred_at: None,
             id: session_id,
             workspace_id: ws,
             project_id: proj,
@@ -1101,6 +1173,7 @@ async fn seed_session(
             .writer
             .insert_observation(ai_memory_core::Sanitized::new(
                 ai_memory_core::NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -1199,6 +1272,32 @@ async fn api_sessions_lists_completed_sessions_for_the_scope() {
     assert_eq!(sessions[0]["session_id"], completed.to_string());
     assert_eq!(sessions[0]["observation_count"], 1);
     assert!(sessions[0]["ended_at"].is_string());
+    assert!(
+        sessions[0]
+            .get("consolidation")
+            .is_some_and(serde_json::Value::is_null)
+    );
+
+    store
+        .writer
+        .enqueue_session_consolidation(ws, proj, completed)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let with_job = json_body(resp).await;
+    assert_eq!(
+        with_job["sessions"][0]["consolidation"],
+        serde_json::json!({"state":"pending","attempts":0})
+    );
 
     let resp = app
         .oneshot(
@@ -1267,6 +1366,11 @@ async fn api_session_observations_pages_orders_and_caps() {
     );
     let json = json_body(resp).await;
     assert_eq!(json["session"]["session_id"], session_id.to_string());
+    assert!(
+        json["session"]
+            .get("consolidation")
+            .is_some_and(serde_json::Value::is_null)
+    );
     assert_eq!(json["total"], 3);
     assert_eq!(json["limit"], 2);
     assert_eq!(json["offset"], 0);
@@ -2659,6 +2763,76 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
     assert!(body_bytes.is_empty(), "304 body must be empty");
 }
 
+/// The ETag stands for the whole JSON page, not just its markdown. Pinning a
+/// page, retitling it in frontmatter, or another page linking to it changes
+/// what the route returns while the body stays byte-identical; a client that
+/// revalidated with the old tag was told 304 and kept the stale page.
+#[tokio::test]
+async fn api_page_etag_changes_when_metadata_or_backlinks_change_but_body_does_not() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let body = "# Deploy\n\nTag before pushing.";
+    wiki.write_page(wiki_req(ws, proj, "deploy.md", body))
+        .await
+        .unwrap();
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let uri = "/workspaces/default/projects/scratch/pages/deploy.md";
+    let fetch = |etag: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder().uri(uri);
+            if let Some(etag) = etag {
+                req = req.header(header::IF_NONE_MATCH, etag);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+        }
+    };
+    let first = fetch(None).await;
+    let etag = first.headers()[header::ETAG].to_str().unwrap().to_owned();
+    assert_eq!(
+        fetch(Some(etag.clone())).await.status(),
+        StatusCode::NOT_MODIFIED,
+        "an unchanged page still revalidates"
+    );
+
+    // Same body, now pinned.
+    let mut pinned = wiki_req(ws, proj, "deploy.md", body);
+    pinned.pinned = true;
+    wiki.write_page(pinned).await.unwrap();
+    let resp = fetch(Some(etag.clone())).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "pinning must invalidate the ETag"
+    );
+    assert_eq!(json_body(resp).await["pinned"], true);
+    let etag = fetch(None).await.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // Same body, but another page now links here.
+    wiki.write_page(wiki_req(ws, proj, "release.md", "See [[deploy]] first."))
+        .await
+        .unwrap();
+    let resp = fetch(Some(etag)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a new backlink must invalidate the ETag"
+    );
+    assert_eq!(json_body(resp).await["backlinks"][0]["path"], "release.md");
+}
+
 #[tokio::test]
 async fn api_page_handler_etag_differs_per_page() {
     let (_tmp, store, wiki) = setup().await;
@@ -3155,4 +3329,731 @@ async fn namespace_path_lists_its_pages() {
         .await
         .unwrap();
     assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+}
+
+/// #708 on the web surface. The page routes went straight from a URL to the
+/// page body without resolving a scope, and global search had no scope to
+/// resolve, so the guard never saw either: bob could open alice's page in a
+/// browser and find it from the search box.
+#[tokio::test]
+async fn web_reads_honour_grants_in_a_restricted_project() {
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
+    use ai_memory_store::GrantLevel;
+
+    let (_tmp, store, wiki) = setup().await;
+    // Grants only decide anything in a restricted project.
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let client = store
+        .writer
+        .get_or_create_project(ws, "alice-client-work", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        client,
+        "secrets/rates.md",
+        "# Rates\n\nDay rate is confidential.",
+    ))
+    .await
+    .unwrap();
+    let human = |name: &'static str| {
+        let writer = store.writer.clone();
+        async move {
+            writer
+                .create_human_user(
+                    NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let alice = human("alice").await;
+    let bob = human("bob").await;
+    store
+        .writer
+        .grant_memory(alice, client, GrantLevel::Read, None)
+        .await
+        .unwrap();
+
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let web = router(store.reader.clone(), wiki.clone());
+    // `viewer` is what the auth middleware stamps for a database user; `None`
+    // is root, or an install with no database users.
+    let get = |app: axum::Router, uri: &'static str, viewer: Option<UserId>| async move {
+        let mut req = Request::builder().uri(uri);
+        if let Some(viewer) = viewer {
+            req = req.extension(AuthorizedViewer(viewer));
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    };
+
+    // Opening the page, through the API and through the HTML wiki. Bob is
+    // refused with a 403 that says so — not a 404 that sends him looking for
+    // a typo, and not the 500 a refusal used to fall through to.
+    for (app, uri) in [
+        (
+            &api,
+            "/workspaces/default/projects/alice-client-work/pages/secrets/rates.md",
+        ),
+        (&web, "/w/default/alice-client-work/p/secrets/rates.md"),
+        (&web, "/w/default/alice-client-work"),
+    ] {
+        let (status, body) = get(app.clone(), uri, Some(bob)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        assert!(
+            body.contains("not authorized for alice-client-work"),
+            "{uri}: {body}"
+        );
+        assert!(
+            !body.contains("confidential"),
+            "{uri} leaked the body: {body}"
+        );
+
+        assert_eq!(
+            get(app.clone(), uri, Some(alice)).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
+        assert_eq!(get(app.clone(), uri, None).await.0, StatusCode::OK, "{uri}");
+    }
+
+    // Finding it, through the API's global search and the wiki search box.
+    for (app, uri) in [
+        (&api, "/search?q=confidential"),
+        (&web, "/search?q=confidential"),
+    ] {
+        let (status, body) = get(app.clone(), uri, Some(bob)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            !body.contains("secrets/rates.md"),
+            "{uri} surfaced it to bob: {body}"
+        );
+
+        let (_, body) = get(app.clone(), uri, Some(alice)).await;
+        assert!(
+            body.contains("secrets/rates.md"),
+            "{uri} hid it from alice: {body}"
+        );
+        let (_, body) = get(app.clone(), uri, None).await;
+        assert!(
+            body.contains("secrets/rates.md"),
+            "{uri} with no viewer: {body}"
+        );
+    }
+}
+
+/// Pins a documented, by-design boundary (see `docs/users.md`): under a
+/// trusted-proxy deployment, a proxied non-root end-user is authenticated as
+/// [`ai_memory_core::AuthLevel::User`] with an [`ai_memory_core::ActorContext`]
+/// (`auth.rs::authenticate_token`'s proxy branch), but — unlike a database
+/// user — is never stamped with an [`ai_memory_core::AuthorizedViewer`],
+/// because grants are keyed on `UserId` and a proxied identity has none.
+/// `viewer_from_parts` reads a missing `AuthorizedViewer` as "no per-project
+/// check applies" (same as root, or an install with no database users), so
+/// the per-project authorization gate is a pass-through for this actor: a
+/// `restricted` project is readable with no grant at all. This is NOT an
+/// endorsement of a gap to close — the proxy is the authorization boundary in
+/// this deployment shape — it is a pin so a future change to this behavior is
+/// an intentional decision, not a silent regression.
+///
+/// This mirrors `web_reads_honour_grants_in_a_restricted_project`'s harness:
+/// that test's own `viewer: None` case already exercises the same code path
+/// (a missing `AuthorizedViewer`), but doesn't carry the extensions a real
+/// trusted-proxy request would, so it doesn't document *why* that is safe
+/// here. The real middleware (`authenticate_token`) is not reachable from
+/// this router-only harness, so this stamps the same extensions it would
+/// have stamped, by hand.
+#[tokio::test]
+async fn a_trusted_proxy_user_is_not_subject_to_restricted_without_a_db_identity() {
+    use ai_memory_core::{ActorContext, AuthLevel};
+
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let client = store
+        .writer
+        .get_or_create_project(ws, "alice-client-work", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        client,
+        "secrets/rates.md",
+        "# Rates\n\nDay rate is confidential.",
+    ))
+    .await
+    .unwrap();
+    // A real database user, with no grant, is correctly refused — the
+    // control proving the project really is restricted.
+    let carol = store
+        .writer
+        .create_human_user(
+            ai_memory_core::NewUser {
+                username: "carol".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let web = router(store.reader.clone(), wiki.clone());
+    let routes = [
+        (
+            api.clone(),
+            "/workspaces/default/projects/alice-client-work/pages/secrets/rates.md",
+        ),
+        (
+            web.clone(),
+            "/w/default/alice-client-work/p/secrets/rates.md",
+        ),
+    ];
+
+    // Control: carol as a *database* user (AuthorizedViewer stamped, no
+    // grant) is refused on both surfaces.
+    for (app, uri) in &routes {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(*uri)
+                    .extension(ai_memory_core::AuthorizedViewer(carol))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    // The pinned case: the same project, read by a request carrying the
+    // extensions a trusted-proxy non-root user actually gets (`ActorContext`
+    // + `AuthLevel::User`) and nothing else — no `AuthorizedViewer`. Today
+    // this is admitted.
+    for (app, uri) in &routes {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(*uri)
+                    .extension(ActorContext {
+                        user: Some("carol-proxied".into()),
+                        ..ActorContext::default()
+                    })
+                    .extension(AuthLevel::User)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{uri}: trusted-proxy user without a DB identity must be admitted today (pinned boundary)"
+        );
+    }
+}
+
+/// #708, second half on the web: bob can no longer read or search alice's
+/// repositories, but every listing, the graph, the workspace overview and a
+/// page's link panel still told him they existed and roughly what was in
+/// them — repository names, workspace names that are organisation names, page
+/// titles and paths. Each surface now shows only what the viewer may read,
+/// with the shared global scope visible to all and nothing filtered with no
+/// viewer.
+#[tokio::test]
+async fn metadata_shows_only_what_the_viewer_may_read() {
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
+    use ai_memory_store::GrantLevel;
+
+    let (_tmp, store, wiki) = setup().await;
+    // Grants only decide anything in a restricted project.
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let w = &store.writer;
+    let acme = w.get_or_create_workspace("acme").await.unwrap();
+    let shared = w.get_or_create_workspace("shared").await.unwrap();
+    let default = w.get_or_create_workspace("default").await.unwrap();
+    let client = w
+        .get_or_create_project(acme, "client-work", None)
+        .await
+        .unwrap();
+    let alpha = w
+        .get_or_create_project(shared, "alpha", None)
+        .await
+        .unwrap();
+    let beta = w.get_or_create_project(shared, "beta", None).await.unwrap();
+    let global = w
+        .get_or_create_project(default, ai_memory_core::GLOBAL_SCOPE_PROJECT, None)
+        .await
+        .unwrap();
+    for (ws, proj, path, body) in [
+        (
+            acme,
+            client,
+            "secrets/rates.md",
+            "# Rates\n\nDay rate is confidential.",
+        ),
+        (
+            shared,
+            alpha,
+            "notes/alpha-plan.md",
+            "# Alpha plan\n\nAlice's side.",
+        ),
+        // Written after its target so the cross-repository link resolves:
+        // this is the edge bob must not see from alpha's side, nor alice from
+        // beta's.
+        (
+            shared,
+            beta,
+            "notes/beta-plan.md",
+            "# Beta plan\n\nDepends on [[shared/alpha:notes/alpha-plan]].",
+        ),
+        (
+            default,
+            global,
+            "_rules/house-style.md",
+            "# House style\n\nShared by all.",
+        ),
+    ] {
+        wiki.write_page(wiki_req(ws, proj, path, body))
+            .await
+            .unwrap();
+    }
+
+    let human = |name: &'static str| {
+        let writer = store.writer.clone();
+        async move {
+            writer
+                .create_human_user(
+                    NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let alice = human("alice").await;
+    let bob = human("bob").await;
+    let carol = human("carol").await;
+    for (user, repo) in [
+        (alice, client),
+        (alice, alpha),
+        (bob, beta),
+        (carol, alpha),
+        (carol, beta),
+    ] {
+        w.grant_memory(user, repo, GrantLevel::Read, None)
+            .await
+            .unwrap();
+    }
+
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let web = router(store.reader.clone(), wiki.clone());
+    let get = |app: axum::Router, uri: &'static str, viewer: Option<UserId>| async move {
+        let mut req = Request::builder().uri(uri);
+        if let Some(viewer) = viewer {
+            req = req.extension(AuthorizedViewer(viewer));
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    };
+    let shows = |body: &str, needle: &str| body.contains(needle);
+
+    // Workspaces: a workspace is listed only if it holds something readable.
+    // `acme` is an organisation's name; bob holds nothing in it.
+    let (_, body) = get(api.clone(), "/workspaces", Some(bob)).await;
+    assert!(!shows(&body, "\"acme\""), "bob sees acme: {body}");
+    assert!(shows(&body, "\"shared\""), "{body}");
+    assert!(
+        shows(&body, "\"default\""),
+        "the global scope stays visible: {body}"
+    );
+    let (_, body) = get(api.clone(), "/workspaces", Some(alice)).await;
+    assert!(
+        shows(&body, "\"acme\"") && shows(&body, "\"shared\""),
+        "{body}"
+    );
+    let (_, body) = get(api.clone(), "/workspaces", None).await;
+    assert!(shows(&body, "\"acme\""), "no viewer lists all: {body}");
+
+    // Project listings: the API, the API narrowed to a workspace, and the
+    // wiki's front page.
+    for (app, uri) in [(&api, "/projects"), (&web, "/")] {
+        let (status, body) = get(app.clone(), uri, Some(bob)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(shows(&body, "beta"), "{uri}: {body}");
+        assert!(
+            shows(&body, "_global"),
+            "{uri}: global stays visible: {body}"
+        );
+        assert!(
+            !shows(&body, "client-work"),
+            "{uri} leaked client-work: {body}"
+        );
+        assert!(!shows(&body, "alpha"), "{uri} leaked alpha: {body}");
+
+        let (_, body) = get(app.clone(), uri, None).await;
+        assert!(
+            shows(&body, "client-work") && shows(&body, "alpha") && shows(&body, "beta"),
+            "{uri} with no viewer: {body}"
+        );
+    }
+    let (_, body) = get(api.clone(), "/projects?workspace=acme", Some(bob)).await;
+    assert_eq!(body.trim(), "[]", "bob sees acme's projects: {body}");
+
+    // The graph: an edge needs BOTH ends readable. Alice reads alpha only and
+    // bob reads beta only, so neither sees beta -> alpha; carol reads both.
+    for viewer in [Some(alice), Some(bob)] {
+        let (_, body) = get(api.clone(), "/graph", viewer).await;
+        assert!(
+            !shows(&body, "alpha-plan"),
+            "{viewer:?} sees the edge: {body}"
+        );
+        assert!(
+            !shows(&body, "beta-plan"),
+            "{viewer:?} sees the edge: {body}"
+        );
+    }
+    for viewer in [Some(carol), None] {
+        let (_, body) = get(api.clone(), "/graph", viewer).await;
+        assert!(
+            shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+            "{viewer:?} lost the edge: {body}"
+        );
+    }
+
+    // A page's link panel is the same edge seen from one page. The panel,
+    // not the body: beta's own text names the link, and that text is bob's to
+    // read. What must not appear is the resolved far end — alpha's title,
+    // path and repository.
+    let beta_page = "/workspaces/shared/projects/beta/pages/notes/beta-plan.md";
+    let links = |body: &str| {
+        let page: serde_json::Value = serde_json::from_str(body).unwrap();
+        page["links"].to_string()
+    };
+    let (status, body) = get(api.clone(), beta_page, Some(bob)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(links(&body), "[]", "bob's link panel leaked alpha: {body}");
+    let (_, body) = get(api.clone(), beta_page, Some(carol)).await;
+    assert!(
+        links(&body).contains("alpha-plan"),
+        "carol lost a link she can read: {body}"
+    );
+
+    // Workspace overview. In `shared` bob sees beta and never alpha — titles,
+    // paths and the health lists alike.
+    let (status, body) = get(api.clone(), "/workspaces/shared/overview", Some(bob)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(shows(&body, "beta-plan"), "{body}");
+    assert!(
+        !shows(&body, "alpha-plan"),
+        "bob's overview leaked alpha: {body}"
+    );
+    let (_, body) = get(api.clone(), "/workspaces/shared/overview", None).await;
+    assert!(
+        shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+        "no viewer: {body}"
+    );
+    // A workspace holding nothing he may read is refused, not answered with an
+    // overview of zeros that would read as "nothing is happening here".
+    let (status, body) = get(api.clone(), "/workspaces/acme/overview", Some(bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(shows(&body, "not authorized for acme"), "{body}");
+    assert!(!shows(&body, "rates"), "{body}");
+    let (status, body) = get(api.clone(), "/workspaces/acme/overview", Some(alice)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(shows(&body, "secrets/rates.md"), "{body}");
+}
+
+#[tokio::test]
+async fn api_recent_incremental_paginates_over_120_pages_and_binds_cursor() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    for n in 0..125 {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, &format!("p{n:03}.md"), "Page", "body"))
+            .await
+            .unwrap();
+    }
+    let app = api_router(store.reader.clone(), wiki);
+    let base = "/workspaces/default/projects/scratch/recent";
+    let mut url = format!("{base}?updated_since=2000-01-01T00:00:00Z&limit=37");
+    let mut paths = Vec::new();
+    let mut first_cursor = None;
+    loop {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let pages = json["pages"].as_array().unwrap();
+        assert!(pages.len() <= 37);
+        paths.extend(
+            pages
+                .iter()
+                .map(|page| page["path"].as_str().unwrap().to_owned()),
+        );
+        let Some(cursor) = json["next_cursor"].as_str() else {
+            break;
+        };
+        first_cursor.get_or_insert_with(|| cursor.to_owned());
+        url = format!("{base}?cursor={cursor}&limit=37");
+    }
+    assert_eq!(paths.len(), 125);
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), 125);
+    let cursor = first_cursor.unwrap();
+    let resume = format!("{base}?cursor={cursor}&limit=37");
+    let mut replay_bodies = Vec::new();
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&resume).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        replay_bodies.push(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        replay_bodies[0], replay_bodies[1],
+        "unchanged data gives a stable continuation"
+    );
+    use base64::Engine as _;
+    let cursor_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&cursor)
+        .unwrap();
+    let cursor_json: Value = serde_json::from_slice(&cursor_bytes).unwrap();
+    for (key, value) in [
+        ("v", serde_json::json!(2)),
+        ("path", serde_json::json!("../escape.md")),
+        ("updated_at", cursor_json["since"].clone()),
+        ("since", serde_json::json!("invalid")),
+    ] {
+        let mut malformed = cursor_json.clone();
+        malformed[key] = value;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&malformed).unwrap());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}?cursor={raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    for url in [
+        format!("/workspaces/default/projects/other/recent?cursor={cursor}"),
+        format!("{base}?cursor={cursor}&updated_since=2001-01-01T00:00:00Z"),
+        format!("{base}?cursor=zz"),
+        format!("{base}?cursor={}", "a".repeat(8194)),
+        format!("{base}?updated_since=yesterday"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{base}?limit=1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=30"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+    use ai_memory_store::{AccessMode, GrantLevel};
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .set_new_project_mode(AccessMode::Restricted)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "private-memory", None)
+        .await
+        .unwrap();
+    for n in 0..2 {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, &format!("p{n}.md"), "Page", "body"))
+            .await
+            .unwrap();
+    }
+    let mut users = Vec::new();
+    for name in ["alice", "bob"] {
+        users.push(
+            store
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    store
+        .writer
+        .grant_memory(users[0], proj, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let app = api_router(store.reader.clone(), wiki);
+    let request = |uri: String, user| {
+        Request::builder()
+            .uri(uri)
+            .extension(AuthorizedViewer(user))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let base = "/workspaces/default/projects/private-memory/recent";
+    let first = app
+        .clone()
+        .oneshot(request(
+            format!("{base}?updated_since=2000-01-01T00:00:00Z&limit=1"),
+            users[0],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    let url = format!("{base}?cursor={}", json["next_cursor"].as_str().unwrap());
+    assert_eq!(
+        app.clone()
+            .oneshot(request(url.clone(), users[1]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(url.clone(), users[0]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        store
+            .writer
+            .revoke_memory(users[0], proj, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        app.oneshot(request(url, users[0])).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a cursor cannot retain access after its user's grant is revoked"
+    );
 }

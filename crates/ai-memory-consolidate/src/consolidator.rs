@@ -5,17 +5,22 @@
 //! [`Wiki::write_page`] so the supersession chain + git auto-commit
 //! kicks in automatically.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
+    complete_structured_with_operation_id,
 };
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, project_observations};
 use crate::types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, Relations, SlotKind,
@@ -60,8 +65,86 @@ impl From<serde_json::Error> for ConsolidatorError {
     }
 }
 
+/// Redacted one-line summary of a consolidation failure:
+/// `consolidation failed: class=<class> status=<status-or-none>`.
+///
+/// For typed boundaries where the full error text would leak a provider
+/// response body — the SessionEnd queue's persisted `last_error` and the
+/// `McpError` returned by `memory_consolidate`. It keeps what an operator
+/// needs to diagnose: `class` is a fixed label per `ConsolidatorError`
+/// variant (or [`LlmError::class`] for LLM failures) and `status` is the
+/// HTTP status captured by the failure ([`LlmError::http_status`]), or
+/// `none`. It never carries the cause's `Display`, a response body, URL,
+/// prompt, token, or headers.
+#[must_use]
+pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
+    let (class, status) = match error {
+        ConsolidatorError::Memory(_) => ("memory", None),
+        ConsolidatorError::Store(_) => ("store", None),
+        ConsolidatorError::Wiki(_) => ("wiki", None),
+        ConsolidatorError::Llm(llm) => (llm.class(), llm.http_status()),
+        ConsolidatorError::Serde(_) => ("serde", None),
+        ConsolidatorError::SessionNotFound(_) => ("session-not-found", None),
+        ConsolidatorError::EmptySession(_) => ("empty-session", None),
+    };
+    format!(
+        "consolidation failed: class={class} status={}",
+        status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
 /// Result alias used by the consolidator.
 pub type ConsolidatorResult<T> = Result<T, ConsolidatorError>;
+
+/// Maximum attempts (initial + retries) for one consolidation LLM call.
+const CONSOLIDATION_LLM_MAX_ATTEMPTS: u32 = 3;
+/// Fixed, short delay between consolidation retries. Deliberately not
+/// tenacity-style escalating backoff — see the cognee #2840 lesson in
+/// `ai-memory-llm`; the same policy `bootstrap.rs` applies to its chunks.
+const CONSOLIDATION_LLM_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Run one consolidation structured call with a short, bounded retry.
+///
+/// A provider answering `429`, any `5xx`, or dropping the connection used to
+/// end the consolidation after a single attempt: over MCP the operator saw an
+/// opaque internal error and had to re-issue the whole call by hand. A couple
+/// of seconds apart, one more identical request rides out those windows.
+/// Deterministic failures — auth, schema, a malformed-request `4xx`, an
+/// unparseable or truncated body — are not retried: the retry would burn
+/// another expensive call and hit the same wall.
+async fn complete_structured_with_retry<T>(
+    llm: &(dyn LlmProvider + 'static),
+    request: ChatRequest,
+    operation_id: ai_memory_llm::LlmOperationId,
+    retry_delay: Duration,
+) -> Result<T, LlmError>
+where
+    T: serde::de::DeserializeOwned + schemars::JsonSchema + Send + 'static,
+{
+    let mut attempt = 1;
+    loop {
+        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
+                // Redacted fields only: this log line is on the consolidation
+                // path, and the `Display` of a provider failure carries the
+                // response body while an HTTP error's can carry the URL.
+                warn!(
+                    attempt,
+                    max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
+                    "consolidation hit a transient LLM error; retrying shortly",
+                );
+                tokio::time::sleep(retry_delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// Karpathy-style single-page consolidator. Holds handles to the
 /// store, wiki, and LLM provider so it can be reused across many
@@ -108,9 +191,23 @@ impl Consolidator {
     ///
     /// `max_input_tokens + max_output_tokens` must fit the provider's context
     /// window. Callers validate the supported minimums when resolving config.
+    ///
+    /// `safety_margin` shrinks the char-count input budget so the flat
+    /// chars-per-token heuristic does not over-admit on denser-than-English
+    /// corpora (pt-BR, code); it is validated to `0 < margin <= 1` at config
+    /// load. See [`DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`] (#884).
     #[must_use]
-    pub fn with_prompt_limits(mut self, max_input_tokens: usize, max_output_tokens: u32) -> Self {
-        self.budgets = PromptBudgets::from_limits(max_input_tokens, max_output_tokens);
+    pub fn with_prompt_limits(
+        mut self,
+        max_input_tokens: usize,
+        max_output_tokens: u32,
+        safety_margin: f64,
+    ) -> Self {
+        self.budgets = PromptBudgets::from_limits_with_margin(
+            max_input_tokens,
+            max_output_tokens,
+            safety_margin,
+        );
         self
     }
 
@@ -178,12 +275,21 @@ impl Consolidator {
             .map(|md| md.body)
             .unwrap_or_default();
         let instructions = self.resolve_instructions(ws, proj, instructions).await;
+        let existing_titles = self
+            .existing_page_titles(ws, proj, &actor, session_id)
+            .await;
+        // One LLM operation, one identity: this fresh id (never the agent's
+        // session id) is shared by every attempt of this invocation; a
+        // re-entry after a crash or a new queue claim is a NEW operation
+        // with a new id.
+        let operation_id = LlmOperationId::new();
         let request = build_request(
             session_id,
             &observations,
             &current_body,
             instructions.as_deref(),
             self.budgets,
+            &existing_titles,
         );
         debug!(
             session = %session_id,
@@ -191,8 +297,27 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let mut page: ConsolidatedPage = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            operation_id,
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
+        // Deterministic backstop for the title-uniqueness prompt rule:
+        // identical harness runs produce near-identical observations, and
+        // the LLM can still return the same generic title an existing
+        // page already carries. Disambiguate before the write so the M8
+        // duplicate-title lint never sees the collision.
+        if let Some((new_title, new_body)) = disambiguate_colliding_session_title(
+            &page.title,
+            &page.body_markdown,
+            &existing_titles,
+            session_id,
+        ) {
+            page.body_markdown = new_body;
+            page.title = new_title;
+        }
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -274,18 +399,55 @@ impl Consolidator {
         &self,
         session_id: SessionId,
     ) -> ConsolidatorResult<(WorkspaceId, ProjectId)> {
+        Ok(self
+            .session_target(session_id)
+            .await?
+            .unwrap_or((self.workspace_id, self.project_id)))
+    }
+
+    /// The repository a consolidation of `session_id` would write into, or
+    /// `None` when the session has neither observations nor a row.
+    ///
+    /// Exactly [`Self::resolve_target`] without the startup fallback, so a
+    /// caller authorizing the write checks the repository the page will
+    /// actually land in (#708). `None` needs no authorization: with no
+    /// observations there is nothing to consolidate, and the consolidation
+    /// itself fails before writing anything — which also keeps an unknown
+    /// session reported as unknown rather than as a refusal on the server's
+    /// default project.
+    ///
+    /// # Errors
+    /// Propagates store errors.
+    pub async fn session_target(
+        &self,
+        session_id: SessionId,
+    ) -> ConsolidatorResult<Option<(WorkspaceId, ProjectId)>> {
         if let Some(scope) = self
             .reader
             .session_scope_from_observations(session_id)
             .await?
         {
-            return Ok(scope);
+            return Ok(Some(scope));
         }
+        Ok(self.reader.session_project_ids(session_id).await?)
+    }
+
+    /// Whether the calling agent wrote the session page through
+    /// `memory_write_page` ([`Wiki::session_page_written_by_agent`]). The
+    /// SessionEnd worker then leaves the page alone instead of replacing it
+    /// with a completion from the server's provider, however many
+    /// observations arrived after it.
+    ///
+    /// # Errors
+    /// Propagates store and wiki errors other than a missing page.
+    pub async fn session_page_written_by_agent(
+        &self,
+        session_id: SessionId,
+    ) -> ConsolidatorResult<bool> {
+        let (ws, proj) = self.resolve_target(session_id).await?;
         Ok(self
-            .reader
-            .session_project_ids(session_id)
-            .await?
-            .unwrap_or((self.workspace_id, self.project_id)))
+            .wiki
+            .session_page_written_by_agent(ws, proj, session_id)?)
     }
 
     /// Resolve the session's creating harness from the persisted session row.
@@ -321,6 +483,31 @@ impl Consolidator {
             existing.as_ref(),
             &req.frontmatter,
         ))
+    }
+
+    /// A model-chosen batch path can name any existing page, including one a
+    /// person pinned. Pinned pages are immutable to automation, and the
+    /// request carries no pin of its own, so writing it would replace the
+    /// body and drop the pin. `_slots/` are pinned automatically and keep
+    /// the state/invariant regime above, so they are not skipped here.
+    fn should_skip_pinned_page_update(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        req: &WritePageRequest,
+    ) -> ConsolidatorResult<bool> {
+        if is_slot_path(&req.path) {
+            return Ok(false);
+        }
+        match self.wiki.read_page(workspace_id, project_id, &req.path) {
+            Ok(md) => Ok(md.frontmatter.get("pinned").and_then(|v| v.as_bool()) == Some(true)),
+            Err(ai_memory_wiki::WikiError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Resolve the project preferences to append to a consolidation
@@ -386,6 +573,18 @@ impl Consolidator {
         } else {
             Some(trimmed.to_string())
         }
+    }
+
+    /// See [`existing_session_page_titles`].
+    async fn existing_page_titles(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        actor: &ai_memory_core::ActorContext,
+        session_id: SessionId,
+    ) -> Vec<String> {
+        existing_session_page_titles(&self.reader, workspace_id, project_id, actor, session_id)
+            .await
     }
 
     async fn slot_snapshots(
@@ -478,20 +677,34 @@ impl Consolidator {
         // standing preferences ride along as untrusted advisory data.
         let slots = self.slot_snapshots(ws, proj, &actor).await?;
         let instructions = self.resolve_instructions(ws, proj, instructions).await;
+        let existing_titles = self
+            .existing_page_titles(ws, proj, &actor, session_id)
+            .await;
+        // One LLM operation, one identity (see `consolidate_session`): the
+        // fresh id is shared by every attempt of this invocation; a
+        // re-entry after a crash or a new queue claim is a new operation
+        // with a new id.
+        let operation_id = LlmOperationId::new();
         let request = build_batch_request_with_slots(
             session_id,
             &observations,
             &slots,
             instructions.as_deref(),
             self.budgets,
+            &existing_titles,
         );
         debug!(
             session = %session_id,
             provider = self.llm.name(),
             "consolidating session (multi-page)",
         );
-        let batch: ConsolidatedBatch =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let batch: ConsolidatedBatch = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            operation_id,
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.
@@ -501,6 +714,9 @@ impl Consolidator {
             let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
+                // Deterministic backstop for the title-uniqueness prompt
+                // rule — see the matching block in `consolidate_session`.
+                disambiguate_anchor_title(&mut req, &mut outcome, &existing_titles, session_id);
             }
             req.evidence = vec![ai_memory_core::PageEvidence {
                 kind: ai_memory_core::PageEvidenceKind::Session,
@@ -563,6 +779,27 @@ impl Consolidator {
                     path = %req.path.as_str(),
                     "skipped invariant slot update: the stored slot is marked \
                      slot_kind=invariant and this update does not declare one",
+                );
+                continue;
+            }
+            if self.should_skip_pinned_page_update(ws, proj, &req)? {
+                warn!(
+                    path = %req.path.as_str(),
+                    "skipped consolidation update: the existing page is pinned, \
+                     and pinned pages are immutable to automation",
+                );
+                continue;
+            }
+            // Final guard for whatever `slugify_page_path` in `build_update`
+            // can't fix (dot-segments, reserved DOS device names, `.git`,
+            // ...), mirroring bootstrap's #847 fix: skip this one page
+            // rather than let `Wiki::apply_batch`'s atomic `ensure_portable`
+            // check abort every other page in the batch (#848).
+            if let Err(e) = req.path.ensure_portable() {
+                warn!(
+                    path = %req.path.as_str(),
+                    error = %e,
+                    "skipped consolidation page update: path is not portable",
                 );
                 continue;
             }
@@ -634,7 +871,17 @@ fn build_update(
         let slug = slugify_for_rule(&effective_title);
         format!("_rules/{slug}.md")
     } else {
-        upd.path.clone()
+        // The LLM sometimes echoes free text straight into a page path (a
+        // conventional-commit subject like `build(sandbox): orchestrate`).
+        // That passes `PagePath::new` (deliberately tolerant) but fails
+        // `ensure_portable`, which `Wiki::apply_batch` enforces atomically —
+        // one bad path there would abort every page in this batch, not just
+        // its own (#848, same class as bootstrap's #847). Sanitize before
+        // `PagePath::new` so every downstream use of `path` (rule routing
+        // already produces a safe slug above, slot placement, and the
+        // `req.path == anchor` comparison in `consolidate_session_multi`)
+        // sees this one, consistent, sanitized value.
+        slugify_page_path(&upd.path)
     };
     let path = PagePath::new(final_path)?;
     let tier = upd.tier;
@@ -839,6 +1086,7 @@ pub fn build_batch_request(session_id: SessionId, observations: &[Observation]) 
         &[],
         None,
         PromptBudgets::default(),
+        &[],
     )
 }
 
@@ -848,15 +1096,24 @@ fn build_batch_request_with_slots(
     slots: &[SlotSnapshot],
     instructions: Option<&str>,
     budgets: PromptBudgets,
+    existing_titles: &[String],
 ) -> ChatRequest {
-    let mut prefix = String::new();
-    prefix.push_str(
+    // Stable prefix first so prefix-caching providers can reuse it across
+    // sessions of the same project: the fixed batch scaffolding (header +
+    // field schema) and the project instructions lead the message, then the
+    // per-project slot/title state, then the per-session id and the
+    // observation dump at the end. Budget math is unchanged — only the
+    // block order moved.
+    let mut fixed_header = String::new();
+    fixed_header.push_str(
         "You are compiling a Karpathy-style multi-page wiki update. Given the \
          session's observation log, produce a ConsolidatedBatch:\n\n",
     );
-    prefix.push_str("Session id: ");
-    prefix.push_str(&session_id.to_string());
-    prefix.push_str("\n\nObservations:\n");
+
+    let mut observations_header = String::new();
+    observations_header.push_str("Session id: ");
+    observations_header.push_str(&session_id.to_string());
+    observations_header.push_str("\n\nObservations:\n");
 
     let mut mandatory_suffix = String::new();
     mandatory_suffix.push_str(
@@ -927,20 +1184,27 @@ fn build_batch_request_with_slots(
          \x20\x20\"rationale\": \"<one short sentence about why this batch>\"\n\
          }\n",
     );
+    let titles_block = render_title_uniqueness_section(existing_titles);
     let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
-        count_chars(&prefix).saturating_add(count_chars(&mandatory_suffix)),
+        count_chars(&fixed_header)
+            .saturating_add(count_chars(&mandatory_suffix))
+            .saturating_add(count_chars(&observations_header))
+            .saturating_add(count_chars(&titles_block)),
     );
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-    let mut suffix = render_slot_snapshots(slots, slots_budget);
-    suffix.push_str(&mandatory_suffix);
-    suffix.push_str(&instructions_block);
+    let slots_block = render_slot_snapshots(slots, slots_budget);
 
     let observation_chars = budgets.remaining_input_chars::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
-        count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        count_chars(&fixed_header)
+            .saturating_add(count_chars(&mandatory_suffix))
+            .saturating_add(count_chars(&observations_header))
+            .saturating_add(count_chars(&titles_block))
+            .saturating_add(count_chars(&instructions_block))
+            .saturating_add(count_chars(&slots_block)),
     );
     let projected = project_observations(
         observations,
@@ -951,9 +1215,14 @@ fn build_batch_request_with_slots(
         )
         .with_context_label("batch consolidation"),
     );
-    let mut buf = prefix;
+    let mut buf = String::new();
+    buf.push_str(&fixed_header);
+    buf.push_str(&mandatory_suffix);
+    buf.push_str(&instructions_block);
+    buf.push_str(&slots_block);
+    buf.push_str(&titles_block);
+    buf.push_str(&observations_header);
     buf.push_str(&projected.text);
-    buf.push_str(&suffix);
 
     ChatRequest {
         system: Some(BATCH_SYSTEM_PROMPT.into()),
@@ -1001,23 +1270,35 @@ fn build_request(
     current_body: &str,
     instructions: Option<&str>,
     budgets: PromptBudgets,
+    existing_titles: &[String],
 ) -> ChatRequest {
-    let mut prefix = String::new();
-    prefix.push_str("Session id: ");
-    prefix.push_str(&session_id.to_string());
-    prefix.push_str("\nObservations (in order):\n\n");
+    // Stable prefix first so prefix-caching providers can reuse it across
+    // sessions of the same project: the project instructions lead, then the
+    // per-page current body and titles, then the per-session id and the
+    // observation dump at the end. Budget math is unchanged — only the
+    // block order moved.
+    let mut observations_header = String::new();
+    observations_header.push_str("Session id: ");
+    observations_header.push_str(&session_id.to_string());
+    observations_header.push_str("\nObservations (in order):\n\n");
 
-    let optional_budget =
-        budgets.optional_context_budget::<ConsolidatedPage>(SYSTEM_PROMPT, count_chars(&prefix));
+    let optional_budget = budgets.optional_context_budget::<ConsolidatedPage>(
+        SYSTEM_PROMPT,
+        count_chars(&observations_header),
+    );
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-    let mut suffix = render_current_body_section(current_body, current_body_budget);
-    suffix.push_str(&instructions_block);
+    let titles_block = render_title_uniqueness_section(existing_titles);
+    let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
+    let current_body_block = render_current_body_section(current_body, current_body_budget);
 
     let observation_chars = budgets.remaining_input_chars::<ConsolidatedPage>(
         SYSTEM_PROMPT,
-        count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        count_chars(&observations_header)
+            .saturating_add(count_chars(&instructions_block))
+            .saturating_add(count_chars(&current_body_block))
+            .saturating_add(count_chars(&titles_block)),
     );
     let projected = project_observations(
         observations,
@@ -1028,9 +1309,12 @@ fn build_request(
         )
         .with_context_label("single-page consolidation"),
     );
-    let mut buf = prefix;
+    let mut buf = String::new();
+    buf.push_str(&instructions_block);
+    buf.push_str(&current_body_block);
+    buf.push_str(&titles_block);
+    buf.push_str(&observations_header);
     buf.push_str(&projected.text);
-    buf.push_str(&suffix);
 
     ChatRequest {
         system: Some(SYSTEM_PROMPT.into()),
@@ -1057,6 +1341,17 @@ pub const DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 100_000;
 
 /// Default maximum generated tokens for a consolidation response.
 pub const DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
+/// Default multiplier applied to the char-count input budget (#884).
+///
+/// `max_input_tokens` is turned into a char budget with a flat
+/// [`CHARS_PER_TOKEN`] heuristic. That ratio holds for English prose but
+/// over-admits on denser corpora — pt-BR prose and source code tokenize at
+/// closer to ~2.1 chars/token, so a 3:1 estimate overshot the real token
+/// count by ~40% and tripped provider `max_input_tokens` limits. Shrinking
+/// the effective char budget to 80% of the nominal value buys that headroom
+/// back for the common case while leaving English budgets close to before.
+pub const DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN: f64 = 0.8;
 
 /// Conservative character-to-token estimate for provider-neutral budgeting.
 /// The exact tokenizer is provider/model-specific, so this is a target rather
@@ -1111,8 +1406,26 @@ struct PromptBudgets {
 
 impl PromptBudgets {
     fn from_limits(max_input_tokens: usize, max_output_tokens: u32) -> Self {
+        // A bare limit applies no safety margin (margin 1.0), preserving the
+        // historical char budget; production tightens it via config (#884).
+        Self::from_limits_with_margin(max_input_tokens, max_output_tokens, 1.0)
+    }
+
+    /// Derive budgets from the token limits, shrinking the char-count input
+    /// budget by `safety_margin` (#884). The margin compensates for the flat
+    /// [`CHARS_PER_TOKEN`] heuristic over-admitting on denser-than-English
+    /// corpora (pt-BR, code). Callers pass a validated `0 < margin <= 1`.
+    fn from_limits_with_margin(
+        max_input_tokens: usize,
+        max_output_tokens: u32,
+        safety_margin: f64,
+    ) -> Self {
+        let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
+        // `safety_margin` is validated to `0 < margin <= 1` at config load, so
+        // the product never exceeds `nominal` and the cast cannot overflow.
+        let max_input_chars = (nominal as f64 * safety_margin) as usize;
         Self {
-            max_input_chars: max_input_tokens.saturating_mul(CHARS_PER_TOKEN),
+            max_input_chars,
             max_output_tokens,
         }
     }
@@ -1376,14 +1689,33 @@ fn indent_for_prompt(s: &str) -> String {
 
 /// ASCII-slug a rule title for the `_rules/<slug>.md` path.
 ///
-/// Lower-cases, replaces runs of non-`[a-z0-9]` with `-`, trims
-/// leading/trailing hyphens, and caps at 60 chars. Falls back to
-/// `rule` when the input has no alphanumerics (e.g. a non-Latin
-/// title) so we always produce a valid PagePath.
+/// Folds Latin diacritics to ASCII (NFD-decompose, drop the combining
+/// marks), lower-cases, replaces runs of non-`[a-z0-9]` with `-`, trims
+/// leading/trailing hyphens, and caps at 60 chars at a word boundary.
+/// Falls back to `rule` when the input has no folding-surviving
+/// alphanumerics (e.g. a CJK-only title) so we always produce a valid
+/// PagePath.
+///
+/// Diacritic folding (#886) is why `estável`/`retenção` slug as
+/// `estavel`/`retencao` instead of `est-vel`/`reten-o`: without the fold
+/// each accented letter is a non-ASCII scalar that the run-collapse turns
+/// into a `-`, splitting the word. The truncation cuts at the last hyphen
+/// within the 60-char budget so a long title ends on a whole word rather
+/// than mid-word. Non-decomposable Latin-1 letters (ß, ø, æ) still fall to
+/// `-`, which is acceptable; all pt-BR letters decompose to ASCII.
 fn slugify_for_rule(title: &str) -> String {
-    let mut out = String::with_capacity(title.len());
+    // NFD decomposition splits `é` into `e` + U+0301 (combining acute),
+    // `ç` into `c` + U+0327, etc. Reuses ai-memory-core's icu_normalizer.
+    let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(title);
+    let mut out = String::with_capacity(decomposed.len());
     let mut prev_dash = true; // leading dashes get folded
-    for c in title.chars() {
+    for c in decomposed.chars() {
+        // Drop the combining marks NFD left behind (the Combining
+        // Diacritical Marks block), rather than folding them to a `-`,
+        // so the base letter stands alone: `e` + U+0301 -> `e`.
+        if ('\u{0300}'..='\u{036F}').contains(&c) {
+            continue;
+        }
         let lower = c.to_ascii_lowercase();
         if lower.is_ascii_alphanumeric() {
             out.push(lower);
@@ -1397,10 +1729,43 @@ fn slugify_for_rule(title: &str) -> String {
         out.pop();
     }
     if out.is_empty() {
+        // A title with no ASCII letter or digit (Cyrillic, CJK, ...) would
+        // share one name with every other such title, and each rule would
+        // overwrite the last. Name it after the title instead. A title with
+        // no letter or digit at all has nothing to name it by. The hash takes
+        // the same fold as the ASCII slug (lower-cased words, separators
+        // collapsed) so a restated rule updates its own page; combining
+        // marks stay with their letter so `й` and `и` remain distinct.
+        let in_word = |c: char| c.is_alphanumeric() || ('\u{0300}'..='\u{036F}').contains(&c);
+        let key = decomposed
+            .split(|c: char| !in_word(c))
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join("-");
+        if key.chars().any(char::is_alphanumeric) {
+            let digest = Sha256::digest(key.as_bytes());
+            let hex: String = digest
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            return format!("rule-{hex}");
+        }
         return "rule".into();
     }
     if out.len() > 60 {
-        out.truncate(60);
+        // `out` is ASCII here, so byte index 60 is a char boundary. Cut at
+        // the last hyphen inside the window to end on a whole word; only
+        // hard-cut at 60 when the window holds no hyphen (one long token).
+        // The window includes index 60: a hyphen there means the first 60
+        // chars are whole words, and they all fit. A hyphen in the first
+        // half does not count, because cutting there would throw most of
+        // the title away (a short first word before one long token).
+        match out[..=60].rfind('-').filter(|&idx| idx >= 30) {
+            Some(idx) => out.truncate(idx),
+            None => out.truncate(60),
+        }
         while out.ends_with('-') {
             out.pop();
         }
@@ -1412,6 +1777,191 @@ fn short_id(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
+/// How many latest-page titles feed duplicate-title avoidance on the
+/// session page. Bounds both the collision guard's key set and the
+/// briefing query; older collisions fall through to the M8 lint.
+const EXISTING_TITLES_QUERY_LIMIT: usize = 200;
+
+/// How many of the queried titles ride in the prompt. The guard checks
+/// the whole queried set; the prompt only needs enough examples to steer
+/// the LLM away from the generic-title local optimum.
+const EXISTING_TITLES_PROMPT_LIMIT: usize = 15;
+
+/// Case-insensitive, whitespace-collapsed title key — the same grouping
+/// the M8 duplicate-title lint uses, so "collides here" means "the lint
+/// flags it there".
+fn title_collision_key(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Deterministic disambiguation for a session page title that collided
+/// with another latest page. The suffix carries the session's short id,
+/// unique per page, so one application always breaks the tie and
+/// re-consolidation of the same session is stable.
+fn disambiguated_session_title(title: &str, session_id: SessionId) -> String {
+    format!(
+        "{} (session {})",
+        title.trim(),
+        short_id(&session_id.to_string())
+    )
+}
+
+/// Rewrite the body's leading H1 when it echoes the pre-disambiguation
+/// title, so the rendered page does not open with the stale heading.
+/// Anything else (deeper heading, mid-body echo, prose) is left alone.
+fn retitle_leading_h1(body: &str, old: &str, new: &str) -> String {
+    let heading = format!("# {old}");
+    match body.strip_prefix(&heading) {
+        Some(after) if after.is_empty() || after.starts_with('\n') => {
+            format!("# {new}{after}")
+        }
+        _ => body.to_string(),
+    }
+}
+
+/// The bounded existing-titles list for the consolidation prompt.
+fn render_existing_titles(titles: &[String]) -> String {
+    titles
+        .iter()
+        .take(EXISTING_TITLES_PROMPT_LIMIT)
+        .map(|t| format!("- {t}\n"))
+        .collect()
+}
+
+/// Shared uniqueness block injected into both consolidation prompts.
+/// The system prompt carries the durable rule; this carries the
+/// project's actual titles, which only the caller can see. Absent
+/// when the project has no other pages — the rule has nothing to
+/// list, and the fixed prompt text would otherwise eat into the
+/// minimum observation budget.
+fn render_title_uniqueness_section(titles: &[String]) -> String {
+    if titles.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## Existing page titles in this project\n\
+         Do not reuse any of these for a page title — a case-insensitive \
+         match counts as a reuse. The title must distinguish THIS session \
+         (goal, outcome, or target); a generic phrase that other runs of \
+         the same harness would also produce is not a title.\n{}\n",
+        render_existing_titles(titles)
+    )
+}
+
+/// Latest page titles for duplicate-title avoidance on the session
+/// page, seen through the same owner visibility as the slot
+/// snapshots. The session's OWN page is excluded: re-consolidation
+/// refreshing its own previous title is correct, not a collision.
+/// Best-effort — a store hiccup degrades to "no context" rather
+/// than failing consolidation. Shared with the MCP `memory_write_page`
+/// session-page path, which writes the same page without a completion.
+pub async fn existing_session_page_titles(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    actor: &ai_memory_core::ActorContext,
+    session_id: SessionId,
+) -> Vec<String> {
+    let own_path = format!("sessions/{session_id}.md");
+    match reader
+        .briefing_for_project(
+            workspace_id,
+            project_id,
+            EXISTING_TITLES_QUERY_LIMIT,
+            ai_memory_core::OwnerFilter::for_actor_context(actor),
+            false,
+        )
+        .await
+    {
+        Ok(brief) => {
+            let from_briefing = brief
+                .recent_pages
+                .iter()
+                .chain(brief.pinned.iter())
+                .chain(brief.rules.iter())
+                .chain(brief.slots.iter())
+                .filter(|p| p.path != own_path)
+                .map(|p| p.title.clone());
+            let from_settled = brief
+                .settled
+                .iter()
+                .filter(|p| p.path != own_path)
+                .map(|p| p.title.clone());
+            from_briefing.chain(from_settled).collect()
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "existing-title query failed; skipping duplicate-title context"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Shared collision backstop for every session-page write path: the
+/// single-page and batch consolidations, and `memory_write_page` with a
+/// `session_id`.
+/// When `title` already names another latest page (case-insensitive,
+/// whitespace-collapsed — the M8 grouping), suffix the session short
+/// id and retitle a matching leading H1. `None` when the title is free.
+pub fn disambiguate_colliding_session_title(
+    title: &str,
+    body: &str,
+    existing_titles: &[String],
+    session_id: SessionId,
+) -> Option<(String, String)> {
+    let taken: HashSet<String> = existing_titles
+        .iter()
+        .map(|t| title_collision_key(t))
+        .collect();
+    if !taken.contains(&title_collision_key(title)) {
+        return None;
+    }
+    let new_title = disambiguated_session_title(title, session_id);
+    warn!(
+        session = %session_id,
+        old = %title,
+        new = %new_title,
+        "session page title collided with an existing page; disambiguated",
+    );
+    Some((
+        new_title.clone(),
+        retitle_leading_h1(body, title, &new_title),
+    ))
+}
+
+/// Guard for the LLM's freedom over `title` on the batch session-anchor
+/// write path. Delegates to [`disambiguate_colliding_session_title`].
+fn disambiguate_anchor_title(
+    req: &mut WritePageRequest,
+    outcome: &mut ConsolidationOutcome,
+    existing_titles: &[String],
+    session_id: SessionId,
+) {
+    let Some(current) = req
+        .frontmatter
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some((new_title, new_body)) =
+        disambiguate_colliding_session_title(&current, &req.body, existing_titles, session_id)
+    else {
+        return;
+    };
+    req.frontmatter["title"] = serde_json::Value::String(new_title.clone());
+    req.title = Some(new_title.clone());
+    req.body = new_body;
+    outcome.new_title = new_title;
+}
+
 /// System prompt for single-page consolidation. Loaded at compile
 /// time from `prompts/single_consolidate_system.md`.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.md");
@@ -1421,6 +1971,65 @@ mod tests {
     use super::*;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Body a fake provider returns in the redaction tests; the summary must
+    /// never contain it.
+    const REDACTION_SENTINEL: &str = "SENTINEL_PRIVATE_BODY";
+
+    /// The summary is the only failure text the SessionEnd queue persists and
+    /// the `memory_consolidate` MCP call returns, so it must expose the
+    /// class/status and drop the provider body.
+    #[test]
+    fn redacted_summary_exposes_class_and_status_without_body() {
+        let error = ConsolidatorError::Llm(LlmError::Provider {
+            status: 400,
+            body: REDACTION_SENTINEL.into(),
+        });
+        let summary = redacted_error_summary(&error);
+        assert_eq!(summary, "consolidation failed: class=provider status=400");
+        assert!(!summary.contains(REDACTION_SENTINEL));
+    }
+
+    /// Switching the variant to `Serde` changes only the allowed fields:
+    /// the stable shape stays, `class`/`status` take the new values, and the
+    /// body still never enters the summary.
+    #[test]
+    fn redacted_summary_variant_switch_changes_only_class_and_status() {
+        let provider = ConsolidatorError::Llm(LlmError::Provider {
+            status: 400,
+            body: REDACTION_SENTINEL.into(),
+        });
+        let serde_error = ConsolidatorError::Serde(REDACTION_SENTINEL.into());
+        let provider_summary = redacted_error_summary(&provider);
+        let serde_summary = redacted_error_summary(&serde_error);
+        assert_eq!(
+            provider_summary,
+            "consolidation failed: class=provider status=400"
+        );
+        assert_eq!(
+            serde_summary,
+            "consolidation failed: class=serde status=none"
+        );
+        for summary in [&provider_summary, &serde_summary] {
+            assert!(summary.starts_with("consolidation failed: class="));
+            assert!(!summary.contains(REDACTION_SENTINEL));
+        }
+    }
+
+    /// Dropping the HTTP status changes only the status field to `none`;
+    /// the class still comes from the LLM error's fixed label.
+    #[test]
+    fn redacted_summary_without_http_status_reports_none() {
+        let without_status =
+            ConsolidatorError::Llm(LlmError::NotConfigured(REDACTION_SENTINEL.into()));
+        let summary = redacted_error_summary(&without_status);
+        assert_eq!(
+            summary,
+            "consolidation failed: class=not-configured status=none"
+        );
+        assert!(!summary.contains(REDACTION_SENTINEL));
+    }
 
     /// Helper for prompt construction tests.
     fn obs_of_size(body_len: usize) -> Observation {
@@ -1448,12 +2057,857 @@ mod tests {
             "",
             None,
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &request.messages[0].content;
         assert!(prompt.contains("--- observation 1/2 ---"));
         assert!(prompt.contains("id:"));
         assert!(prompt.contains("created_at:"));
         assert!(prompt.contains("importance:"));
+    }
+
+    #[test]
+    fn title_collision_key_groups_case_and_whitespace() {
+        assert_eq!(
+            title_collision_key("  Adversarial   Verification "),
+            title_collision_key("adversarial verification"),
+            "the key must group exactly like the M8 duplicate-title lint",
+        );
+        assert_ne!(
+            title_collision_key("adversarial verification"),
+            title_collision_key("adversarial verification (session 01a0d4e3)"),
+        );
+    }
+
+    #[test]
+    fn disambiguated_session_title_is_deterministic_and_session_specific() {
+        // Fixed ids, not `SessionId::new()`: v7 ids share their timestamp
+        // prefix, so two random ids minted in the same millisecond would
+        // collide on the 8-char short id and flake the distinctness check.
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let other: SessionId = "0193e7a2-0000-7000-8000-000000000002"
+            .parse()
+            .expect("fixed session id");
+        let a = disambiguated_session_title("Adversarial Verification", sid);
+        let b = disambiguated_session_title("Adversarial Verification", sid);
+        assert_eq!(a, b, "re-consolidation must keep the same title");
+        assert!(
+            a.starts_with("Adversarial Verification (session 0193e7a1)"),
+            "suffix carries the session short id: {a}",
+        );
+        assert_ne!(
+            a,
+            disambiguated_session_title("Adversarial Verification", other),
+            "different sessions disambiguate apart",
+        );
+    }
+
+    #[test]
+    fn retitle_leading_h1_only_touches_a_matching_first_heading() {
+        assert_eq!(
+            retitle_leading_h1("# Old Title\n\nbody", "Old Title", "New Title"),
+            "# New Title\n\nbody",
+        );
+        assert_eq!(
+            retitle_leading_h1("# Old Title", "Old Title", "New Title"),
+            "# New Title",
+            "heading-only body still retitles",
+        );
+        assert_eq!(
+            retitle_leading_h1("## Old Title\n", "Old Title", "New Title"),
+            "## Old Title\n",
+            "deeper headings are not the page title",
+        );
+        assert_eq!(
+            retitle_leading_h1("# Old Title Longer\n", "Old Title", "New Title"),
+            "# Old Title Longer\n",
+            "a prefix match is not the page title",
+        );
+        assert_eq!(
+            retitle_leading_h1("prose only", "Old Title", "New Title"),
+            "prose only",
+        );
+    }
+
+    #[test]
+    fn render_title_uniqueness_section_bounded_and_absent_when_empty() {
+        let titles: Vec<String> = (0..30).map(|i| format!("Title {i}")).collect();
+        let section = render_title_uniqueness_section(&titles);
+        assert!(section.contains("Title 0\n") && section.contains("Title 14\n"));
+        assert!(!section.contains("Title 15\n"), "prompt list is bounded");
+        assert!(section.contains("case-insensitive"));
+
+        // A brand-new project omits the block entirely: the durable rule
+        // lives in the system prompt, and fixed prompt text must not eat
+        // into the advertised minimum observation budget.
+        assert!(render_title_uniqueness_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_request_lists_existing_titles_for_uniqueness() {
+        let request = build_request(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            "",
+            None,
+            PromptBudgets::default(),
+            &["Adversarial Verification for Grok Build Harness".to_string()],
+        );
+        let prompt = &request.messages[0].content;
+        assert!(
+            prompt.contains("Adversarial Verification for Grok Build Harness"),
+            "single-page prompt carries the project's existing titles",
+        );
+        assert!(prompt.contains("Do not reuse any of these"));
+    }
+
+    #[test]
+    fn build_batch_request_lists_existing_titles_for_uniqueness() {
+        let request = build_batch_request_with_slots(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            &[],
+            None,
+            PromptBudgets::default(),
+            &["Goal Plan Writer Execution".to_string()],
+        );
+        let prompt = &request.messages[0].content;
+        assert!(
+            prompt.contains("Goal Plan Writer Execution"),
+            "batch prompt carries the project's existing titles",
+        );
+        assert!(prompt.contains("Do not reuse any of these"));
+    }
+
+    /// The observation dump is spliced after the session-id header and is the
+    /// last block of the user message: the fixed batch schema (tier/kind/JSON
+    /// keys) and the project instructions lead the message so the stable
+    /// prefix is reusable, and the dump still follows `Observations:`.
+    fn assert_batch_dump_follows_observations_header(prompt: &str) {
+        let schema = prompt
+            .find("## `tier` field")
+            .expect("batch prompt still carries the schema suffix");
+        let header = prompt
+            .find("\n\nObservations:\n")
+            .expect("batch prompt starts the observation section");
+        let dump = prompt
+            .find("--- observation")
+            .expect("batch prompt projects an observation dump");
+        assert!(
+            schema < header && header < dump,
+            "observation dump must follow Observations:, after the schema suffix; schema={schema} header={header} dump={dump}"
+        );
+    }
+
+    #[test]
+    fn batch_user_message_places_observation_dump_after_schema() {
+        let request = build_batch_request_with_slots(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            &[],
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
+        assert_batch_dump_follows_observations_header(&request.messages[0].content);
+    }
+
+    /// The stable prefix (fixed batch text, project instructions, slot and
+    /// title state) leads the batch user message and must be byte-identical
+    /// across sessions of the same project; only the session id and the
+    /// observation dump vary, and both sit at the end.
+    #[test]
+    fn batch_user_message_prefix_is_stable_across_sessions() {
+        let sid_a: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let sid_b: SessionId = "0193e7a2-0000-7000-8000-000000000002"
+            .parse()
+            .expect("fixed session id");
+        let slots = vec![SlotSnapshot {
+            path: "_slots/focus.md".into(),
+            title: "Focus".into(),
+            slot_kind: SlotKind::State,
+            body: "working context".into(),
+        }];
+        let titles = vec!["Existing Title".to_string()];
+
+        let a = build_batch_request_with_slots(
+            sid_a,
+            &[obs_of_size(20)],
+            &slots,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let b = build_batch_request_with_slots(
+            sid_b,
+            &[obs_of_size(30)],
+            &slots,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let user_a = &a.messages[0].content;
+        let user_b = &b.messages[0].content;
+
+        let marker = "Session id: ";
+        let pos_a = user_a.find(marker).expect("session id line");
+        let pos_b = user_b.find(marker).expect("session id line");
+        assert!(
+            pos_a > 0 && pos_b > 0,
+            "the session id belongs to the variable tail, not the stable prefix"
+        );
+        assert_eq!(
+            &user_a[..pos_a],
+            &user_b[..pos_b],
+            "the stable prefix must be byte-identical across sessions"
+        );
+        assert!(
+            user_a.find("## `tier` field").expect("schema suffix") < pos_a,
+            "the fixed batch schema must lead the message"
+        );
+        assert!(
+            user_a.find("## `tier` field").expect("schema suffix")
+                < user_a
+                    .find(PROJECT_INSTRUCTIONS_HEADER)
+                    .expect("project instructions"),
+            "the fixed batch schema must precede the project instructions"
+        );
+        assert!(
+            user_a
+                .find(PROJECT_INSTRUCTIONS_HEADER)
+                .expect("project instructions")
+                < pos_a,
+            "the project instructions must precede the session id"
+        );
+        let dump = user_a.find("--- observation").expect("observation dump");
+        assert!(
+            pos_a < dump,
+            "the session id must precede the observation dump"
+        );
+        let sid_a_str = sid_a.to_string();
+        let sid_b_str = sid_b.to_string();
+        assert!(
+            user_a[pos_a..].contains(&sid_a_str) && user_b[pos_b..].contains(&sid_b_str),
+            "each session id must appear in its own variable tail"
+        );
+    }
+
+    /// The project instructions lead the single-page user message and must
+    /// be byte-identical across sessions of the same project. In production
+    /// the current body is the session's own page body
+    /// (`sessions/<id>.md`), so it varies per session: the shared prefix ends
+    /// at the current-body block header, and the bodies differ right after
+    /// it. The session id and the observation dump sit at the end.
+    #[test]
+    fn single_user_message_prefix_is_stable_across_sessions() {
+        let sid_a: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let sid_b: SessionId = "0193e7a2-0000-7000-8000-000000000002"
+            .parse()
+            .expect("fixed session id");
+        // Per-session page bodies, as in production: the current body varies
+        // between two sessions of the same project.
+        let body_a = "# session\n\nKept decision A from the first run.";
+        let body_b = "# session\n\nCompletely different draft B.";
+        let titles = vec!["Existing Title".to_string()];
+
+        let a = build_request(
+            sid_a,
+            &[obs_of_size(20)],
+            body_a,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let b = build_request(
+            sid_b,
+            &[obs_of_size(30)],
+            body_b,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let user_a = &a.messages[0].content;
+        let user_b = &b.messages[0].content;
+
+        let body_header = "Current (heuristic) page body";
+        let pos_a = user_a.find(body_header).expect("current body section");
+        let pos_b = user_b.find(body_header).expect("current body section");
+        assert!(
+            pos_a > 0,
+            "the shared prefix (the project instructions) must be non-empty"
+        );
+        assert_eq!(
+            &user_a[..pos_a],
+            &user_b[..pos_b],
+            "the prefix before the first variable block (current body) must be byte-identical across sessions"
+        );
+        assert!(
+            user_a
+                .find(PROJECT_INSTRUCTIONS_HEADER)
+                .expect("project instructions")
+                < pos_a,
+            "the shared prefix is the instructions block"
+        );
+        assert!(
+            user_a[pos_a..].contains(body_a) && !user_a[pos_a..].contains(body_b),
+            "session A's current body must sit right after the shared prefix"
+        );
+        assert!(
+            user_b[pos_b..].contains(body_b) && !user_b[pos_b..].contains(body_a),
+            "session B's current body must differ right after the shared prefix"
+        );
+
+        let marker = "Session id: ";
+        let sid_pos_a = user_a.find(marker).expect("session id line");
+        let sid_pos_b = user_b.find(marker).expect("session id line");
+        assert!(
+            sid_pos_a > pos_a && sid_pos_b > pos_b,
+            "the session id belongs to the variable tail, not the stable prefix"
+        );
+        let dump = user_a.find("--- observation").expect("observation dump");
+        assert!(
+            sid_pos_a < dump,
+            "the session id must precede the observation dump"
+        );
+        let sid_a_str = sid_a.to_string();
+        let sid_b_str = sid_b.to_string();
+        assert!(
+            user_a[sid_pos_a..].contains(&sid_a_str) && user_b[sid_pos_b..].contains(&sid_b_str),
+            "each session id must appear in its own variable tail"
+        );
+    }
+
+    /// Reference assembly of the pre-reorder single-page layout (session id
+    /// and observation dump first, then current body, titles, and
+    /// instructions). It shares the exact budget math and rendered blocks of
+    /// the builder so tests can compare accepted content across the reorder.
+    fn old_order_single_content(
+        session_id: SessionId,
+        observations: &[Observation],
+        current_body: &str,
+        instructions: Option<&str>,
+        budgets: PromptBudgets,
+        existing_titles: &[String],
+    ) -> String {
+        let mut prefix = String::new();
+        prefix.push_str("Session id: ");
+        prefix.push_str(&session_id.to_string());
+        prefix.push_str("\nObservations (in order):\n\n");
+
+        let optional_budget = budgets
+            .optional_context_budget::<ConsolidatedPage>(SYSTEM_PROMPT, count_chars(&prefix));
+        let instructions_block =
+            render_instructions_block(instructions, optional_budget.saturating_div(2));
+        let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
+        let titles_block = render_title_uniqueness_section(existing_titles);
+        let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
+        let mut suffix = render_current_body_section(current_body, current_body_budget);
+        suffix.push_str(&titles_block);
+        suffix.push_str(&instructions_block);
+
+        let observation_chars = budgets.remaining_input_chars::<ConsolidatedPage>(
+            SYSTEM_PROMPT,
+            count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        );
+        let projected = project_observations(
+            observations,
+            &ObservationProjectionConfig::new(
+                observation_chars,
+                MAX_PROJECTED_OBSERVATIONS,
+                MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+            )
+            .with_context_label("single-page consolidation"),
+        );
+        let mut buf = prefix;
+        buf.push_str(&projected.text);
+        buf.push_str(&suffix);
+        buf
+    }
+
+    /// Reference assembly of the pre-reorder batch layout (fixed header,
+    /// session id, observation dump, then slots, fixed schema, titles, and
+    /// instructions). The fixed header and schema text are sliced out of the
+    /// rendered message so the reference reuses the exact shipped bytes.
+    fn old_order_batch_content(
+        rendered: &str,
+        session_id: SessionId,
+        observations: &[Observation],
+        slots: &[SlotSnapshot],
+        instructions: Option<&str>,
+        budgets: PromptBudgets,
+        existing_titles: &[String],
+    ) -> String {
+        let mandatory_start = rendered
+            .find("\nProduce up to 5 page updates")
+            .expect("batch prompt carries the fixed schema suffix");
+        let fixed_header = &rendered[..mandatory_start];
+        let mandatory_suffix = &rendered[mandatory_start
+            ..rendered
+                .find(PROJECT_INSTRUCTIONS_HEADER)
+                .expect("batch prompt carries the project instructions")];
+
+        let mut prefix = String::new();
+        prefix.push_str(fixed_header);
+        prefix.push_str("Session id: ");
+        prefix.push_str(&session_id.to_string());
+        prefix.push_str("\n\nObservations:\n");
+
+        let titles_block = render_title_uniqueness_section(existing_titles);
+        let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
+            BATCH_SYSTEM_PROMPT,
+            count_chars(&prefix)
+                .saturating_add(count_chars(mandatory_suffix))
+                .saturating_add(count_chars(&titles_block)),
+        );
+        let instructions_block =
+            render_instructions_block(instructions, optional_budget.saturating_div(2));
+        let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
+        let mut suffix = render_slot_snapshots(slots, slots_budget);
+        suffix.push_str(mandatory_suffix);
+        suffix.push_str(&titles_block);
+        suffix.push_str(&instructions_block);
+
+        let observation_chars = budgets.remaining_input_chars::<ConsolidatedBatch>(
+            BATCH_SYSTEM_PROMPT,
+            count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        );
+        let projected = project_observations(
+            observations,
+            &ObservationProjectionConfig::new(
+                observation_chars,
+                MAX_PROJECTED_OBSERVATIONS,
+                MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+            )
+            .with_context_label("batch consolidation"),
+        );
+        let mut buf = prefix;
+        buf.push_str(&projected.text);
+        buf.push_str(&suffix);
+        buf
+    }
+
+    /// The reordered message must carry exactly the accepted lines of the
+    /// pre-reorder assembly — no content lost, no content duplicated.
+    fn assert_same_accepted_lines(new_content: &str, old_content: &str) {
+        let mut old_lines: Vec<&str> = old_content.lines().collect();
+        let mut new_lines: Vec<&str> = new_content.lines().collect();
+        old_lines.sort_unstable();
+        new_lines.sort_unstable();
+        assert_eq!(
+            old_lines, new_lines,
+            "accepted content must be identical between the old and the new order"
+        );
+    }
+
+    /// Reordering must admit neither more nor less: on a 16k-input/8k-output
+    /// budget large enough to reach clipping, the pre-reorder assembly and
+    /// the reordered single-page builder accept identical content, only
+    /// permuted.
+    #[test]
+    fn reorder_preserves_accepted_content_single() {
+        let budgets = PromptBudgets::from_limits(16_000, 8_000);
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let observations: Vec<Observation> = (0..24).map(|_| obs_of_size(2_000)).collect();
+        let instructions_text = "prefer concise notes; keep \"sentinel-quotes\" verbatim";
+        let instructions = Some(instructions_text);
+        let current_body = format!(
+            "# huge\n\n{}\n\n## Raw observations\n\n- clip-me\n",
+            "x".repeat(30_000)
+        );
+        let titles = vec!["Existing Title".to_string()];
+
+        let request = build_request(
+            sid,
+            &observations,
+            &current_body,
+            instructions,
+            budgets,
+            &titles,
+        );
+        let new_content = &request.messages[0].content;
+        let old_content = old_order_single_content(
+            sid,
+            &observations,
+            &current_body,
+            instructions,
+            budgets,
+            &titles,
+        );
+
+        assert_eq!(
+            count_chars(new_content),
+            count_chars(&old_content),
+            "reordering must not change the total budgeted length"
+        );
+        assert_same_accepted_lines(new_content, &old_content);
+
+        // Nothing lost, nothing duplicated in the stable sections.
+        let encoded_instructions =
+            serde_json::Value::String(instructions_text.to_string()).to_string();
+        assert_eq!(
+            new_content.matches(&encoded_instructions).count(),
+            1,
+            "the escaped project instructions must appear exactly once"
+        );
+        assert_eq!(new_content.matches("Existing Title").count(), 1);
+        assert!(
+            new_content.contains("[current heuristic page body truncated]"),
+            "clipping is reached on the 16k/8k fixture"
+        );
+        assert!(
+            !new_content.contains("clip-me"),
+            "raw-observation elision is preserved"
+        );
+    }
+
+    /// The single-page observation budget must count the titles block: on a
+    /// knife-edge input budget calibrated so all three equal observations do
+    /// not fit, the middle one is pruned (first and last are hard anchors).
+    /// If the titles block were left out of the `remaining_input_chars`
+    /// sum, the budget would grow by the titles' size and all three
+    /// observations would render. This test asserts the production shape
+    /// exactly, with a large deterministic titles block and real pruning,
+    /// so a sum missing the titles block fails it while the correct sum
+    /// passes.
+    #[test]
+    fn single_observation_budget_accounts_for_the_titles_block() {
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        // Three equal-sized observations (same body length and the same
+        // fixed field lengths — v7 UUID ids are always 36 chars) render
+        // blocks of identical length. The first and last are hard anchors
+        // (never pruned), so the middle one is the only prunable block and
+        // the budget sits exactly on the three-block edge.
+        let observations = vec![obs_of_size(400), obs_of_size(400), obs_of_size(400)];
+        // A deterministic titles block well above the calibration gap
+        // (the renderer caps the list at EXISTING_TITLES_PROMPT_LIMIT, so
+        // the block size is stable across runs).
+        let titles: Vec<String> = (0..80)
+            .map(|i| format!("Existing page title {i:02} with a stable suffix"))
+            .collect();
+        let titles_block = render_title_uniqueness_section(&titles);
+        let title_chars = count_chars(&titles_block);
+        assert!(
+            title_chars >= 512,
+            "the fixture needs a titles block well above the calibration gap: {title_chars}"
+        );
+
+        // Measure one rendered block through the exact projection the
+        // builder uses (a generous budget keeps all three, back-to-back).
+        let probe = project_observations(
+            &observations,
+            &ObservationProjectionConfig::new(
+                100_000,
+                MAX_PROJECTED_OBSERVATIONS,
+                MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+            )
+            .with_context_label("single-page consolidation"),
+        );
+        assert_eq!(
+            probe.omitted_count, 0,
+            "the probe budget must keep all three observations"
+        );
+        let probe_chars = count_chars(&probe.text);
+        assert_eq!(
+            probe_chars % 3,
+            0,
+            "the three observations must render equal-length blocks"
+        );
+        let block_chars = probe_chars / 3;
+
+        // Calibrate the input budget so the observation budget lands just
+        // below three blocks: with the titles counted the middle
+        // observation is pruned (the two hard anchors fit); without them
+        // (S2) all three fit. The gap absorbs the CHARS_PER_TOKEN rounding
+        // of `from_limits`.
+        let mut observations_header = String::new();
+        observations_header.push_str("Session id: ");
+        observations_header.push_str(&sid.to_string());
+        observations_header.push_str("\nObservations (in order):\n\n");
+        let header_chars = count_chars(&observations_header);
+        let gap = 4 * CHARS_PER_TOKEN;
+        let required_total = (3 * block_chars)
+            .saturating_sub(gap)
+            .saturating_add(count_chars(SYSTEM_PROMPT))
+            .saturating_add(schema_chars::<ConsolidatedPage>())
+            .saturating_add(PROMPT_ENVELOPE_RESERVE_CHARS)
+            .saturating_add(header_chars)
+            .saturating_add(title_chars);
+        let budgets = PromptBudgets::from_limits(
+            required_total.div_ceil(CHARS_PER_TOKEN),
+            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+        );
+
+        // The calibration must hold — this is the property that makes the
+        // test bite on the S2 mutation.
+        let observation_chars = budgets.remaining_input_chars::<ConsolidatedPage>(
+            SYSTEM_PROMPT,
+            header_chars.saturating_add(title_chars),
+        );
+        let three_blocks = 3 * block_chars;
+        let two_blocks = 2 * block_chars;
+        assert!(
+            three_blocks > observation_chars,
+            "calibration: all three observations must not fit while the titles are counted (three_blocks={three_blocks}, observation_chars={observation_chars})"
+        );
+        assert!(
+            two_blocks <= observation_chars,
+            "calibration: the two hard-anchor observations must fit while the titles are counted (two_blocks={two_blocks}, observation_chars={observation_chars})"
+        );
+        assert!(
+            three_blocks <= observation_chars.saturating_add(title_chars),
+            "calibration: dropping the titles from the sum must admit the third observation (S2)"
+        );
+
+        let request = build_request(sid, &observations, "", None, budgets, &titles);
+        let user = &request.messages[0].content;
+        assert_eq!(
+            user.matches("--- observation").count(),
+            2,
+            "with the titles block counted into the observation budget only the two hard-anchor observations fit and the middle one is pruned; S2 (titles dropped from the sum) would render all three"
+        );
+        assert!(
+            user.contains("1 observations omitted from single-page consolidation projection"),
+            "the pruned observation must leave its visible omission marker"
+        );
+    }
+
+    /// Same guarantee for the batch builder: on a 16k-input/8k-output budget
+    /// large enough to reach clipping, the old and the new order admit the
+    /// same slots, titles, instructions, and selected observations.
+    #[test]
+    fn reorder_preserves_accepted_content_batch() {
+        let budgets = PromptBudgets::from_limits(16_000, 8_000);
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let observations: Vec<Observation> = (0..24).map(|_| obs_of_size(2_000)).collect();
+        let slots = vec![
+            SlotSnapshot {
+                path: "_slots/focus.md".into(),
+                title: "Focus".into(),
+                slot_kind: SlotKind::State,
+                body: "slot body A ".repeat(150),
+            },
+            SlotSnapshot {
+                path: "_slots/draft.md".into(),
+                title: "Draft".into(),
+                slot_kind: SlotKind::State,
+                body: "slot body B ".repeat(150),
+            },
+        ];
+        let instructions_text = "prefer concise notes; keep \"sentinel-quotes\" verbatim";
+        let instructions = Some(instructions_text);
+        let titles = vec!["Existing Title".to_string()];
+
+        let request = build_batch_request_with_slots(
+            sid,
+            &observations,
+            &slots,
+            instructions,
+            budgets,
+            &titles,
+        );
+        let new_content = &request.messages[0].content;
+        let old_content = old_order_batch_content(
+            new_content,
+            sid,
+            &observations,
+            &slots,
+            instructions,
+            budgets,
+            &titles,
+        );
+
+        assert_eq!(
+            count_chars(new_content),
+            count_chars(&old_content),
+            "reordering must not change the total budgeted length"
+        );
+        assert_same_accepted_lines(new_content, &old_content);
+
+        // Nothing lost, nothing duplicated in the stable sections.
+        let encoded_instructions =
+            serde_json::Value::String(instructions_text.to_string()).to_string();
+        assert_eq!(
+            new_content.matches(&encoded_instructions).count(),
+            1,
+            "the escaped project instructions must appear exactly once"
+        );
+        assert_eq!(new_content.matches("Existing Title").count(), 1);
+        assert_eq!(new_content.matches("_slots/focus.md").count(), 1);
+        assert_eq!(new_content.matches("_slots/draft.md").count(), 1);
+    }
+
+    /// The reorder is pure in-memory assembly: even on degenerate inputs the
+    /// builders finish without touching external state and emit a well-formed
+    /// request with the system prompt still separate.
+    #[test]
+    fn default_builders_total_on_empty_and_minimum_budget_inputs() {
+        let budgets = PromptBudgets::from_limits(
+            MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
+            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+        );
+        let single = build_request(SessionId::new(), &[], "", None, budgets, &[]);
+        let batch = build_batch_request_with_slots(SessionId::new(), &[], &[], None, budgets, &[]);
+        for (name, request) in [("single", &single), ("batch", &batch)] {
+            let user = &request.messages[0].content;
+            assert!(!user.is_empty(), "{name}: user message must not be empty");
+            assert!(
+                user.contains("Observations"),
+                "{name}: the observation section must survive degenerate inputs"
+            );
+            assert!(
+                !request.system.as_deref().unwrap_or_default().is_empty(),
+                "{name}: the system prompt stays separate and non-empty"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_omits_titles_block_when_the_project_is_empty() {
+        let single = build_request(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            "",
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
+        let batch = build_batch_request_with_slots(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            &[],
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
+        assert!(
+            !single.messages[0].content.contains("Existing page titles"),
+            "empty title list must omit the uniqueness block from the single-page user message"
+        );
+        assert!(
+            !batch.messages[0].content.contains("Existing page titles"),
+            "empty title list must omit the uniqueness block from the batch user message"
+        );
+    }
+
+    #[test]
+    fn consolidation_system_prompts_require_session_specific_unique_titles() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(
+                prompt.contains("THIS session"),
+                "{name} prompt must require a session-specific title"
+            );
+            assert!(
+                prompt.contains("generic") && prompt.contains("harness-run"),
+                "{name} prompt must reject generic harness-run titles"
+            );
+            assert!(
+                prompt.contains("listed title"),
+                "{name} prompt must forbid reusing listed titles"
+            );
+        }
+    }
+
+    #[test]
+    fn disambiguate_colliding_session_title_rewrites_only_on_collision() {
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let taken = vec!["Adversarial Verification".to_string()];
+        let (title, body) = disambiguate_colliding_session_title(
+            "Adversarial Verification",
+            "# Adversarial Verification\n\nbody",
+            &taken,
+            sid,
+        )
+        .expect("collision");
+        assert_eq!(title, "Adversarial Verification (session 0193e7a1)");
+        assert_eq!(
+            body,
+            "# Adversarial Verification (session 0193e7a1)\n\nbody"
+        );
+        assert!(
+            disambiguate_colliding_session_title(
+                "Fresh Specific Title",
+                "# Fresh Specific Title\n",
+                &taken,
+                sid,
+            )
+            .is_none(),
+            "a free title is left verbatim"
+        );
+    }
+
+    #[test]
+    fn disambiguate_anchor_title_suffixes_on_collision_only() {
+        let sid = SessionId::new();
+        let taken = vec!["Adversarial Verification".to_string()];
+
+        let mut colliding = WritePageRequest {
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            path: PagePath::new(format!("sessions/{sid}.md")).unwrap(),
+            frontmatter: serde_json::json!({"title": "Adversarial Verification"}),
+            body: "# Adversarial Verification\n\nbody".to_string(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some("Adversarial Verification".to_string()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::default(),
+            evidence: vec![],
+        };
+        let mut outcome = ConsolidationOutcome {
+            path: colliding.path.clone(),
+            dry_run: false,
+            new_title: "Adversarial Verification".to_string(),
+            new_body_markdown: String::new(),
+            page_id: None,
+            tags: Vec::new(),
+        };
+        disambiguate_anchor_title(&mut colliding, &mut outcome, &taken, sid);
+        let effective = colliding.frontmatter["title"].as_str().unwrap();
+        assert_ne!(effective, "Adversarial Verification");
+        assert!(effective.starts_with("Adversarial Verification (session "));
+        assert_eq!(colliding.title.as_deref(), Some(effective));
+        assert_eq!(outcome.new_title, effective);
+        assert_eq!(
+            colliding.body,
+            format!("# {effective}\n\nbody"),
+            "the leading H1 follows the disambiguated title",
+        );
+
+        // No collision, no touch — including the case-flipped variant,
+        // which the lint would also flag.
+        let mut free = WritePageRequest {
+            frontmatter: serde_json::json!({"title": "Fresh Specific Title"}),
+            body: "# Fresh Specific Title\n".to_string(),
+            title: Some("Fresh Specific Title".to_string()),
+            ..colliding
+        };
+        let before = free.frontmatter.clone();
+        let mut free_outcome = ConsolidationOutcome {
+            new_title: "Fresh Specific Title".to_string(),
+            ..outcome
+        };
+        disambiguate_anchor_title(
+            &mut free,
+            &mut free_outcome,
+            &["ADVERSarial   verification".to_string()],
+            sid,
+        );
+        assert_eq!(free.frontmatter, before, "a free title is left verbatim");
     }
 
     #[test]
@@ -1520,6 +2974,7 @@ mod tests {
             &current_body,
             None,
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &request.messages[0].content;
 
@@ -1542,6 +2997,7 @@ mod tests {
             &current_body,
             None,
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &request.messages[0].content;
 
@@ -1578,6 +3034,7 @@ mod tests {
             &"x".repeat(50_000),
             Some(&"preference ".repeat(500)),
             budgets,
+            &[],
         );
 
         assert!(
@@ -1599,6 +3056,7 @@ mod tests {
             &"x".repeat(50_000),
             Some(&"preference ".repeat(500)),
             budgets,
+            &[],
         );
 
         assert!(estimated_input_chars::<ConsolidatedPage>(&request) <= budgets.max_input_chars);
@@ -1613,9 +3071,15 @@ mod tests {
             MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
         );
         let observations = vec![obs_of_size(500)];
-        let single = build_request(SessionId::new(), &observations, "", None, budgets);
-        let batch =
-            build_batch_request_with_slots(SessionId::new(), &observations, &[], None, budgets);
+        let single = build_request(SessionId::new(), &observations, "", None, budgets, &[]);
+        let batch = build_batch_request_with_slots(
+            SessionId::new(),
+            &observations,
+            &[],
+            None,
+            budgets,
+            &[],
+        );
 
         assert!(estimated_input_chars::<ConsolidatedPage>(&single) <= budgets.max_input_chars);
         let batch_chars = estimated_input_chars::<ConsolidatedBatch>(&batch);
@@ -1624,8 +3088,26 @@ mod tests {
             "minimum batch estimate {batch_chars} exceeded {} chars",
             budgets.max_input_chars
         );
-        assert!(single.messages[0].content.contains("body:\n"));
-        assert!(batch.messages[0].content.contains("body:\n"));
+
+        let single_user = &single.messages[0].content;
+        let batch_user = &batch.messages[0].content;
+        assert!(
+            single_user.contains("body:\n"),
+            "single-page floor request must project an observation body"
+        );
+        assert!(
+            batch_user.contains("body:\n"),
+            "batch floor request must project an observation body"
+        );
+        assert!(
+            !single_user.contains("no projection budget"),
+            "single-page floor request must not omit observations"
+        );
+        assert!(
+            !batch_user.contains("no projection budget"),
+            "batch floor request must not omit observations"
+        );
+        assert_batch_dump_follows_observations_header(batch_user);
     }
 
     /// The body excerpt keeps its absolute ceiling on a huge budget: past
@@ -1644,6 +3126,55 @@ mod tests {
         assert_eq!(
             budgets.remaining_input_chars::<ConsolidatedPage>(SYSTEM_PROMPT, usize::MAX),
             0
+        );
+    }
+
+    /// #884: the safety margin scales the char budget by exactly the factor,
+    /// and margin 1.0 reproduces the un-margined budget.
+    #[test]
+    fn safety_margin_scales_input_char_budget() {
+        let full = PromptBudgets::from_limits(10_000, 1_000);
+        assert_eq!(full.max_input_chars, 30_000);
+        assert_eq!(
+            PromptBudgets::from_limits_with_margin(10_000, 1_000, 1.0),
+            full,
+            "margin 1.0 must leave the budget unchanged"
+        );
+        let tightened = PromptBudgets::from_limits_with_margin(10_000, 1_000, 0.8);
+        assert_eq!(
+            tightened.max_input_chars, 24_000,
+            "margin 0.8 must shrink the char budget to 0.8x"
+        );
+        // Output allowance is independent of the input margin.
+        assert_eq!(tightened.max_output_tokens, 1_000);
+    }
+
+    /// #884: a large observation set is packed to the tightened budget, so a
+    /// margin actually reduces how much prompt content is admitted.
+    #[test]
+    fn safety_margin_trims_packed_observations() {
+        let tightened = PromptBudgets::from_limits_with_margin(
+            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            0.8,
+        );
+        let full = PromptBudgets::from_limits(
+            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+        );
+        assert!(tightened.max_input_chars < full.max_input_chars);
+        let observations = (0..256).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
+        let request = build_request(
+            SessionId::new(),
+            &observations,
+            &"x".repeat(50_000),
+            Some(&"preference ".repeat(500)),
+            tightened,
+            &[],
+        );
+        assert!(
+            estimated_input_chars::<ConsolidatedPage>(&request) <= tightened.max_input_chars,
+            "packed request must respect the tightened budget"
         );
     }
 
@@ -1668,6 +3199,7 @@ mod tests {
             &slots,
             Some(&"preference ".repeat(500)),
             budgets,
+            &[],
         );
 
         let estimated = estimated_input_chars::<ConsolidatedBatch>(&request);
@@ -1708,13 +3240,45 @@ mod tests {
         assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
     }
 
-    /// Non-Latin / empty-after-cleanup titles fall back to a static
-    /// slug instead of producing an invalid PagePath.
+    /// Empty and punctuation-only titles fall back to a static slug
+    /// instead of producing an invalid PagePath.
     #[test]
     fn slugify_falls_back_for_unprintable_titles() {
         assert_eq!(slugify_for_rule(""), "rule");
         assert_eq!(slugify_for_rule("!!!"), "rule");
-        assert_eq!(slugify_for_rule("中文"), "rule");
+    }
+
+    /// A title in a script with no ASCII letters would slug to `rule` like
+    /// every other, and each rule would overwrite the last at
+    /// `_rules/rule.md`. Each gets a name of its own, stable across
+    /// spellings of the same title and always a valid page path.
+    #[test]
+    fn slugify_names_non_latin_titles_apart() {
+        let chinese = slugify_for_rule("中文");
+        let russian = slugify_for_rule("Не коммитить секреты");
+        assert!(chinese.starts_with("rule-"), "{chinese}");
+        assert!(russian.starts_with("rule-"), "{russian}");
+        assert_ne!(chinese, russian);
+        assert_eq!(slugify_for_rule("中文"), chinese);
+        // `й` as one scalar and as `и` + a combining breve are one title.
+        assert_eq!(
+            slugify_for_rule("\u{439}\u{43e}"),
+            slugify_for_rule("\u{438}\u{306}\u{43e}")
+        );
+        // A restated title updates its own page, as an ASCII one does: case,
+        // spacing and punctuation do not name a new rule.
+        assert_eq!(slugify_for_rule("не коммитить  секреты!"), russian);
+        assert_eq!(slugify_for_rule("НЕ КОММИТИТЬ, СЕКРЕТЫ."), russian);
+        // A combining mark is part of its letter, not a separator.
+        assert_ne!(
+            slugify_for_rule("\u{439}\u{43e}"),
+            slugify_for_rule("\u{438} \u{43e}")
+        );
+        for slug in [chinese, russian] {
+            let path = format!("_rules/{slug}.md");
+            let path = PagePath::new(path).unwrap();
+            path.ensure_portable().unwrap();
+        }
     }
 
     /// Very long titles get capped at 60 chars with no trailing dash.
@@ -1724,6 +3288,66 @@ mod tests {
         let slug = slugify_for_rule(&long);
         assert!(slug.len() <= 60);
         assert!(!slug.ends_with('-'));
+    }
+
+    /// #886: Latin diacritics fold to ASCII instead of splitting the word
+    /// into a hyphen (`estável` -> `estavel`, not `est-vel`).
+    #[test]
+    fn slugify_folds_latin_diacritics() {
+        assert_eq!(slugify_for_rule("Modelo estável"), "modelo-estavel");
+        assert_eq!(
+            slugify_for_rule("Política de retenção"),
+            "politica-de-retencao"
+        );
+        // Every pt-BR accented letter decomposes to ASCII.
+        assert_eq!(
+            slugify_for_rule("á é í ó ú â ê ô ã õ ç à ü"),
+            "a-e-i-o-u-a-e-o-a-o-c-a-u"
+        );
+    }
+
+    /// #886: a title longer than 60 chars is cut at a hyphen (word
+    /// boundary), not mid-word.
+    #[test]
+    fn slugify_truncates_at_word_boundary() {
+        let title = "aaaaaaaa bbbbbbbb cccccccc dddddddd eeeeeeee ffffffff gggggggg hhhhhhhh";
+        let slug = slugify_for_rule(title);
+        assert!(slug.len() <= 60);
+        assert!(!slug.ends_with('-'));
+        // The cut lands on the last whole word inside the budget, dropping
+        // the partial `gggggggg` rather than slicing it.
+        assert_eq!(
+            slug,
+            "aaaaaaaa-bbbbbbbb-cccccccc-dddddddd-eeeeeeee-ffffffff"
+        );
+    }
+
+    /// #886: a CJK-only title still folds to no ASCII slug — diacritic
+    /// folding must not resurrect it — and takes the title-keyed fallback.
+    #[test]
+    fn slugify_cjk_still_falls_back() {
+        assert!(slugify_for_rule("中文标题").starts_with("rule-"));
+    }
+
+    /// A slug whose first 60 chars already end on a whole word keeps that
+    /// word: the hyphen right after it (index 60) is the boundary, and a
+    /// window that stops before it dropped the word (follow-up to #886).
+    #[test]
+    fn slugify_keeps_a_word_that_ends_exactly_at_the_cap() {
+        let title = ["abcd"; 11].join(" ") + " abcde more";
+        let slug = slugify_for_rule(&title);
+        assert_eq!(slug, ["abcd"; 11].join("-") + "-abcde");
+        assert_eq!(slug.len(), 60);
+    }
+
+    /// A boundary in the first half would throw most of the title away: a
+    /// short word before one long token must not collapse the slug to that
+    /// word, so the cut falls back to the hard 60 (follow-up to #886).
+    #[test]
+    fn slugify_does_not_collapse_to_a_short_first_word() {
+        let slug = slugify_for_rule(&format!("a {}", "b".repeat(70)));
+        assert_eq!(slug.len(), 60);
+        assert!(slug.starts_with("a-bbb"), "slug collapsed to {slug:?}");
     }
 
     fn update_with_summary(summary: Option<&str>) -> crate::types::ConsolidatedPageUpdate {
@@ -2044,6 +3668,36 @@ mod tests {
     }
 
     #[test]
+    fn build_update_appends_md_to_bare_non_rule_path() {
+        // #885: the LLM returns a multi-page path with no extension
+        // (`decisions/smart-model-luna`). The non-rule branch routes it
+        // through `slugify_page_path`, which must land it as a portable
+        // `.md` page rather than storing it extensionless.
+        let update = crate::types::ConsolidatedPageUpdate {
+            path: "decisions/smart-model-luna".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "Smart model Luna".into(),
+            body_markdown: "body".into(),
+            summary: None,
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            relations: Relations::default(),
+            entities: Vec::new(),
+        };
+        let (req, _) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update,
+            true,
+            &ai_memory_core::ActorContext::anonymous(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.path.as_str(), "decisions/smart-model-luna.md");
+    }
+
+    #[test]
     fn build_update_stamps_request_actor_and_author() {
         let update = crate::types::ConsolidatedPageUpdate {
             path: "notes/x.md".into(),
@@ -2231,8 +3885,14 @@ mod tests {
             slot_kind: SlotKind::Invariant,
             body: "This is stable unless a later observation contradicts it.".into(),
         }];
-        let request =
-            build_batch_request_with_slots(session_id, &[], &slots, None, PromptBudgets::default());
+        let request = build_batch_request_with_slots(
+            session_id,
+            &[],
+            &slots,
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
         let prompt = &request.messages[0].content;
         assert!(prompt.contains("Current `_slots/` pages"));
         assert!(prompt.contains("_slots/project_context.md | slot_kind=invariant"));
@@ -2413,6 +4073,365 @@ mod tests {
             _schema: serde_json::Value,
         ) -> ai_memory_llm::LlmResult<serde_json::Value> {
             Ok(self.0.clone())
+        }
+    }
+
+    /// Which failure a [`FlakyLlm`] raises before it starts answering.
+    #[derive(Clone, Copy)]
+    enum ScriptedFailure {
+        /// A provider `503`: transient, so the retry must absorb it.
+        Transient,
+        /// An expired credential: deterministic, so a retry cannot help.
+        Deterministic,
+    }
+
+    /// Fails as scripted for its first `failures` structured calls, then
+    /// answers `response`, counting every attempt.
+    struct FlakyLlm {
+        calls: AtomicUsize,
+        failures: usize,
+        failure: ScriptedFailure,
+        response: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyLlm {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        fn model(&self) -> &str {
+            "flaky"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.failures {
+                return Err(match self.failure {
+                    ScriptedFailure::Transient => LlmError::Provider {
+                        status: 503,
+                        body: "This model is currently experiencing high demand.".into(),
+                    },
+                    ScriptedFailure::Deterministic => LlmError::Auth("expired".into()),
+                });
+            }
+            Ok(self.response.clone())
+        }
+    }
+
+    fn scripted_page() -> serde_json::Value {
+        serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        })
+    }
+
+    /// Records the operation id of every structured call and answers a
+    /// fixed valid page or batch — the id is the subject under test, not
+    /// the response.
+    struct OpIdCapturingLlm {
+        response: serde_json::Value,
+        ids: std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>,
+    }
+
+    impl OpIdCapturingLlm {
+        /// Build a capturing LLM, keeping a shared handle to the ids it
+        /// records so a test can assert on them after the run.
+        fn new(
+            response: serde_json::Value,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>) {
+            let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    response,
+                    ids: ids.clone(),
+                },
+                ids,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OpIdCapturingLlm {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn model(&self) -> &str {
+            "capturing"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Ok(self.response.clone())
+        }
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
+    /// A briefly overloaded provider must not end the consolidation: the
+    /// retry absorbs it and the caller still gets the page.
+    #[tokio::test]
+    async fn a_transient_provider_failure_is_retried() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: 2, // fails twice, answers on the 3rd (= the budget)
+            failure: ScriptedFailure::Transient,
+            response: scripted_page(),
+        };
+
+        let page: ConsolidatedPage = complete_structured_with_retry(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("a transient failure that clears within the budget must succeed");
+
+        assert_eq!(page.title, "Queue decision");
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            3,
+            "should have retried twice"
+        );
+    }
+
+    /// An outage that outlasts the budget gives up instead of retrying
+    /// forever, and reports the provider error it actually saw.
+    #[tokio::test]
+    async fn a_transient_provider_failure_gives_up_after_the_budget() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: usize::MAX, // never clears
+            failure: ScriptedFailure::Transient,
+            response: scripted_page(),
+        };
+
+        let err = complete_structured_with_retry::<ConsolidatedPage>(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("a persistently transient failure must eventually give up");
+
+        assert!(err.is_transient());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            CONSOLIDATION_LLM_MAX_ATTEMPTS as usize,
+            "must stop at the attempt budget, not retry forever"
+        );
+    }
+
+    /// A deterministic failure is not retried, and a consolidation whose
+    /// completion never arrives writes no page.
+    #[tokio::test]
+    async fn a_deterministic_provider_failure_is_not_retried_and_writes_no_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let llm = Arc::new(FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: usize::MAX,
+            failure: ScriptedFailure::Deterministic,
+            response: scripted_page(),
+        });
+
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an auth error must fail the consolidation");
+
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic error must fail on the first call, no retries"
+        );
+        assert!(
+            page_missing(&wiki, ws, proj, &format!("sessions/{session}.md")),
+            "a failed consolidation must not write a page"
+        );
+    }
+
+    /// Gateway compatibility of a fresh operation id: the 36-character
+    /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
+    fn assert_fresh_gateway_form(id: LlmOperationId) {
+        let s = id.to_string();
+        assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
+        let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
+        assert_eq!(
+            parsed.get_version_num(),
+            7,
+            "a fresh operation id is UUID v7: {s}"
+        );
+    }
+
+    /// Operation identity: two consolidation invocations of the SAME
+    /// session are two LLM operations — two distinct fresh UUID v7 ids,
+    /// never the session id. Controls use a v7 session (`SessionId::new`)
+    /// and a v4-style session (the random form agents commonly carry), so
+    /// no derivation from the session's own bytes can sneak back in.
+    #[tokio::test]
+    async fn each_invocation_gets_a_fresh_operation_id_independent_of_the_session() {
+        let actor = ai_memory_core::ActorContext::anonymous();
+        // v7 (time-ordered) and v4 (random, agent-style) sessions.
+        let sessions = [SessionId::new(), SessionId(uuid::Uuid::new_v4())];
+        for session in sessions {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+            let ws = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            let proj = store
+                .writer
+                .get_or_create_project(ws, "scratch", None)
+                .await
+                .unwrap();
+            seed_session(store.db_path(), session, ws, proj);
+            let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+            // Two single invocations of the SAME session: two distinct
+            // fresh v7 ids, neither one the session id.
+            let (llm1, ids1) = OpIdCapturingLlm::new(scripted_page());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm1),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let (llm2, ids2) = OpIdCapturingLlm::new(scripted_page());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm2),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let single1 = ids1.lock().unwrap().clone();
+            let single2 = ids2.lock().unwrap().clone();
+            assert_eq!(single1.len(), 1, "one default single call per invocation");
+            assert_eq!(single2.len(), 1, "one default single call per invocation");
+            assert_ne!(
+                single1[0], single2[0],
+                "two single invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(single1[0]);
+            assert_fresh_gateway_form(single2[0]);
+            assert_ne!(
+                single1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
+
+            // Same for the multi default path: two invocations, two ids.
+            let batch = serde_json::json!({
+                "rationale": "test operation identity",
+                "updates": [
+                    {
+                        "path": format!("sessions/{session}.md"),
+                        "tier": "episodic",
+                        "kind": "fact",
+                        "title": "Session narrative",
+                        "body_markdown": "Session body.",
+                        "tags": []
+                    },
+                    {
+                        "path": "concepts/queue.md",
+                        "tier": "semantic",
+                        "kind": "fact",
+                        "title": "Queue",
+                        "body_markdown": "Concept body.",
+                        "tags": []
+                    }
+                ]
+            });
+            let (llm3, ids3) = OpIdCapturingLlm::new(batch.clone());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm3),
+                ws,
+                proj,
+            )
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let (llm4, ids4) = OpIdCapturingLlm::new(batch);
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm4),
+                ws,
+                proj,
+            )
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let multi1 = ids3.lock().unwrap().clone();
+            let multi2 = ids4.lock().unwrap().clone();
+            assert_eq!(multi1.len(), 1, "one default multi call per invocation");
+            assert_eq!(multi2.len(), 1, "one default multi call per invocation");
+            assert_ne!(
+                multi1[0], multi2[0],
+                "two multi invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(multi1[0]);
+            assert_fresh_gateway_form(multi2[0]);
+            assert_ne!(
+                multi1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
         }
     }
 
@@ -2646,6 +4665,90 @@ mod tests {
                 outcome.path.as_str()
             );
         }
+    }
+
+    /// A batch with one page whose LLM-produced path contains a
+    /// Windows-illegal `:` (copied verbatim from a conventional-commit
+    /// subject, e.g. `build(sandbox): orchestrate`) must not abort the whole
+    /// run: `build_update` sanitizes the path in place (same class of fix as
+    /// bootstrap's #847) and the batch's sibling valid page survives. Before
+    /// the fix, the bad path passed `PagePath::new` (deliberately tolerant)
+    /// and only failed later at `ensure_portable` inside `Wiki::apply_batch`,
+    /// which is atomic — one bad page there lost every page in the batch
+    /// (#848).
+    #[tokio::test]
+    async fn batch_with_illegal_char_path_is_sanitized_not_aborted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "rationale": "one bad path, one good",
+            "updates": [
+                {
+                    "path": "concepts/build(sandbox): orchestrate the run.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Bad path page",
+                    "body_markdown": "Bad path body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/good.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Good path page",
+                    "body_markdown": "Good path body.",
+                    "tags": []
+                }
+            ]
+        });
+
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("a sanitizable bad path must not fail (or abort) the whole batch");
+
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "both pages, including the sanitized one, must be written"
+        );
+
+        let sanitized_path = outcomes
+            .iter()
+            .find(|o| o.path.as_str().starts_with("concepts/build"))
+            .expect("the offending page must still be written, under a sanitized path")
+            .path
+            .clone();
+        assert!(
+            !sanitized_path.as_str().contains(':'),
+            "the sanitized path must not contain the Windows-illegal `:`: {}",
+            sanitized_path.as_str()
+        );
+        assert!(
+            sanitized_path.ensure_portable().is_ok(),
+            "the sanitized path must pass the portability check"
+        );
+
+        let good = wiki
+            .read_page(ws, proj, &PagePath::new("concepts/good.md").unwrap())
+            .unwrap();
+        assert_eq!(good.frontmatter["title"], "Good path page");
+
+        let bad = wiki.read_page(ws, proj, &sanitized_path).unwrap();
+        assert_eq!(bad.frontmatter["title"], "Bad path page");
     }
 
     /// A batch whose single update targets `path` — the model chooses this
@@ -3183,6 +5286,7 @@ mod tests {
             &[],
             Some(malicious),
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &with.messages[0].content;
         assert!(prompt.contains("Project consolidation preferences (untrusted project data)"));
@@ -3205,6 +5309,7 @@ mod tests {
             &[],
             None,
             PromptBudgets::default(),
+            &[],
         );
         assert!(
             !without.messages[0]
@@ -3219,6 +5324,7 @@ mod tests {
             "",
             Some("focus on API changes"),
             PromptBudgets::default(),
+            &[],
         );
         assert!(
             single.messages[0]
@@ -3341,6 +5447,104 @@ mod tests {
                 .await
                 .is_none(),
             "expired standing preferences must be absent from consolidation",
+        );
+    }
+
+    /// A multi-page batch whose model-chosen path names an existing pinned
+    /// page must leave that page alone: `docs/usage.md` promises pinned pages
+    /// are immutable to automation. Before the guard the batch replaced the
+    /// body and wrote the new version with `pinned = 0`. Controls in the same
+    /// batch: an unpinned page is updated, and a `_slots/` state slot (pinned
+    /// automatically) is still refreshed.
+    #[tokio::test]
+    async fn batch_update_to_a_pinned_page_keeps_its_body_and_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let pinned_path = PagePath::new("notes/curated-history.md").unwrap();
+        let control_path = PagePath::new("notes/plain-note.md").unwrap();
+        let slot_path = PagePath::new("_slots/current-focus.md").unwrap();
+        for (path, pinned, body) in [
+            (&pinned_path, true, "Hand-curated history."),
+            (&control_path, false, "An ordinary unpinned note."),
+            (&slot_path, false, "Old focus."),
+        ] {
+            wiki.write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: path.clone(),
+                frontmatter: serde_json::json!({}),
+                body: body.into(),
+                tier: Tier::Semantic,
+                pinned,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut response = batch_targeting(pinned_path.as_str(), "Generated decision body.");
+        for (path, body) in [
+            (&control_path, "Generated control body."),
+            (&slot_path, "New focus."),
+        ] {
+            let mut update = response["updates"][0].clone();
+            update["path"] = serde_json::json!(path.as_str());
+            update["body_markdown"] = serde_json::json!(body);
+            response["updates"].as_array_mut().unwrap().push(update);
+        }
+
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcomes.iter().all(|o| o.path != pinned_path),
+            "the skipped page must not be reported as written",
+        );
+
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let latest_pinned = |path: &PagePath| -> i64 {
+            db.query_row(
+                "SELECT pinned FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+                 AND path = ?3 AND is_latest = 1",
+                rusqlite::params![ws.as_bytes(), proj.as_bytes(), path.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let pinned_page = wiki.read_page(ws, proj, &pinned_path).unwrap();
+        assert!(pinned_page.body.contains("Hand-curated history."));
+        assert!(!pinned_page.body.contains("Generated decision body."));
+        assert_eq!(
+            latest_pinned(&pinned_path),
+            1,
+            "the pin must survive the batch"
+        );
+
+        let control_page = wiki.read_page(ws, proj, &control_path).unwrap();
+        assert!(control_page.body.contains("Generated control body."));
+        let slot_page = wiki.read_page(ws, proj, &slot_path).unwrap();
+        assert!(
+            slot_page.body.contains("New focus."),
+            "state slots still refresh"
         );
     }
 }
