@@ -62,6 +62,9 @@ Content-Type: application/json
 {"username":"alice","password":"…"}
 ```
 
+`/auth/login` and `/auth/recovery` answer 415 to any other content type, so a
+form post or a `text/plain` request from another site cannot reach them.
+
 Do not put `AI_MEMORY_AUTH_TOKEN`, `aim_` keys, session values, or CSRF values
 in `localStorage`. Before any human password or completed bootstrap exists,
 deprecated GET-only browser compatibility may accept the root bearer through
@@ -196,6 +199,9 @@ links + back-links.
   "backlinks": [ { "path": "sessions/2026-05-27.md", "title": "Session 2026-05-27", "kind": "session" } ]
 }
 ```
+
+`created_at` is when the page's oldest retained version was written, so it
+stays put across rewrites; `updated_at` is when the latest version was written.
 
 `404` for missing workspace/project, missing page row, or missing file
 on disk (the body is read from the markdown file at request time).
