@@ -13,6 +13,10 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-10-16** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.1 release)** | **0.951** | [longmemeval-s-3.1.0-release.md](longmemeval-s-3.1.0-release.md) |
+| **2026-10-16** | LongMemEval-S (v1) | **local embeddings + observation stream (3.1 release)** | **0.940** | [longmemeval-s-3.1.0-release.md](longmemeval-s-3.1.0-release.md) |
+| **2026-10-15** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0.1 release)** | **0.951** | [longmemeval-s-3.0.1-release.md](longmemeval-s-3.0.1-release.md) |
+| **2026-10-15** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0.1 release)** | **0.943** | [longmemeval-s-3.0.1-release.md](longmemeval-s-3.0.1-release.md) |
 | **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0.0 release; on by default)** | **0.951** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
 | **2026-10-13** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0.0 release; on by default)** | **0.945** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
 | 2026-09-21 | LongMemEval-S (v1) | local embeddings (2.4 RC, current release) | 0.815 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
@@ -20,6 +24,20 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 2026-10-16 minor-release run found no material retrieval regression
+against 3.0.1. FTS is identical at every overall cutoff. Local embeddings
+moved from 0.943 to 0.940 `hit@5`, inside the pre-registered +/-0.005 noise
+band; its latency and context size stayed stable. See the
+[3.1 release report](longmemeval-s-3.1.0-release.md) for every slice, ingest
+performance, commands, and the explicit post-measurement commit boundary.
+
+The 2026-10-15 patch-release re-run found no retrieval regression against
+3.0.0. FTS accuracy is identical (`hit@5` 0.951), while local embeddings
+moved 0.945 -> 0.943, inside the +/-0.005 overall noise band. Query p50/p95
+improved from 13/112 to 12/101 ms for FTS and from 99/232 to 98/228 ms for
+local embeddings. See the [3.0.1 release report](longmemeval-s-3.0.1-release.md)
+for slice results, ingest performance, commands, and exact provenance.
 
 The 2026-10-13 rows are the 3.0.0 release benchmark: all 470 questions on the
 release-candidate code, comparing the stream off and on with the same build
@@ -66,6 +84,14 @@ is an artifact of the harness, not of production capture. The observation
 stream recovered nearly all of that FTS gap (0.662 → 0.951).
 
 ## A/B comparisons (R2)
+
+The [2026-10-15 consolidation literal-fidelity
+run](consolidation-literal-fidelity-2026-10-15.md) compares the default
+projection with the opt-in `verbatim_residue` request on the same model over
+three runs. The residue reduced generated-session projection loss from 8/15
+facts to 3/15 and recovered a stable 1/5 newly visible facts on the pages,
+without changing kept-fact recall, parse rate or invention counts. It is a
+prompt-input benchmark and is separate from the retrieval baselines above.
 
 The harness can also A/B two configs over the same question set and report
 an accuracy + latency + context-tokens triple with a baseline→candidate

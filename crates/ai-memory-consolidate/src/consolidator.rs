@@ -165,6 +165,8 @@ pub struct Consolidator {
     /// Namespace engine-written slots under the operator that produced them.
     /// Off unless the server enables it; see `[slots] per_user`.
     per_user_slots: bool,
+    /// Include bounded literal tokens from omitted prompt observations.
+    verbatim_residue: bool,
     /// Prompt input/output limits derived from `[consolidation]`.
     budgets: PromptBudgets,
 }
@@ -189,6 +191,7 @@ impl Consolidator {
             workspace_id,
             project_id,
             per_user_slots: false,
+            verbatim_residue: false,
             budgets: PromptBudgets::default(),
         }
     }
@@ -225,6 +228,13 @@ impl Consolidator {
     #[must_use]
     pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
         self.per_user_slots = enabled;
+        self
+    }
+
+    /// Include the opt-in verbatim residue in consolidation prompts.
+    #[must_use]
+    pub fn with_verbatim_residue(mut self, enabled: bool) -> Self {
+        self.verbatim_residue = enabled;
         self
     }
 
@@ -289,13 +299,14 @@ impl Consolidator {
         // re-entry after a crash or a new queue claim is a NEW operation
         // with a new id.
         let operation_id = LlmOperationId::new();
-        let request = build_request(
+        let request = build_request_with_residue(
             session_id,
             &observations,
             &current_body,
             instructions.as_deref(),
             self.budgets,
             &existing_titles,
+            self.verbatim_residue,
         );
         debug!(
             session = %session_id,
@@ -705,13 +716,14 @@ impl Consolidator {
         // re-entry after a crash or a new queue claim is a new operation
         // with a new id.
         let operation_id = LlmOperationId::new();
-        let request = build_batch_request_with_slots(
+        let request = build_batch_request_with_residue(
             session_id,
             &observations,
             &slots,
             instructions.as_deref(),
             self.budgets,
             &existing_titles,
+            self.verbatim_residue,
         );
         debug!(
             session = %session_id,
@@ -731,7 +743,24 @@ impl Consolidator {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
-            let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
+            // A path `slugify_page_path` cannot repair (a leading slash, an
+            // empty or dot segment) fails `PagePath::new` inside
+            // `build_update`. Skip that page like the `ensure_portable`
+            // guard below does, rather than let one bad path fail every
+            // other page of the batch (#848).
+            let (mut req, mut outcome) = match build_update(ws, proj, upd, false, &actor, author_id)
+            {
+                Ok(built) => built,
+                Err(ConsolidatorError::Memory(e)) => {
+                    warn!(
+                        path = %upd.path,
+                        error = %e,
+                        "skipped consolidation page update: path is invalid",
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // Deterministic backstop for the title-uniqueness prompt
@@ -1120,17 +1149,23 @@ fn render_instructions_block(instructions: Option<&str>, max_chars: usize) -> St
 /// multi-page consolidation. Exposed so off-tree A/B harnesses
 /// (e.g. `evals/`) can exercise the same workload against
 /// alternative providers without duplicating the prompt.
-pub fn build_batch_request(session_id: SessionId, observations: &[Observation]) -> ChatRequest {
-    build_batch_request_with_slots(
+pub fn build_batch_request(
+    session_id: SessionId,
+    observations: &[Observation],
+    verbatim_residue: bool,
+) -> ChatRequest {
+    build_batch_request_with_residue(
         session_id,
         observations,
         &[],
         None,
         PromptBudgets::default(),
         &[],
+        verbatim_residue,
     )
 }
 
+#[cfg(test)]
 fn build_batch_request_with_slots(
     session_id: SessionId,
     observations: &[Observation],
@@ -1138,6 +1173,26 @@ fn build_batch_request_with_slots(
     instructions: Option<&str>,
     budgets: PromptBudgets,
     existing_titles: &[String],
+) -> ChatRequest {
+    build_batch_request_with_residue(
+        session_id,
+        observations,
+        slots,
+        instructions,
+        budgets,
+        existing_titles,
+        false,
+    )
+}
+
+fn build_batch_request_with_residue(
+    session_id: SessionId,
+    observations: &[Observation],
+    slots: &[SlotSnapshot],
+    instructions: Option<&str>,
+    budgets: PromptBudgets,
+    existing_titles: &[String],
+    verbatim_residue: bool,
 ) -> ChatRequest {
     // Stable prefix first so prefix-caching providers can reuse it across
     // sessions of the same project: the fixed batch scaffolding (header +
@@ -1255,7 +1310,8 @@ fn build_batch_request_with_slots(
             MAX_PROJECTED_OBSERVATIONS,
             MAX_PROJECTED_OBSERVATION_BODY_CHARS,
         )
-        .with_context_label("batch consolidation"),
+        .with_context_label("batch consolidation")
+        .with_verbatim_residue(verbatim_residue),
     );
     let mut buf = String::new();
     buf.push_str(&fixed_header);
@@ -1310,6 +1366,7 @@ pub const BATCH_SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikili
     "the observations"
 );
 
+#[cfg(test)]
 fn build_request(
     session_id: SessionId,
     observations: &[Observation],
@@ -1317,6 +1374,26 @@ fn build_request(
     instructions: Option<&str>,
     budgets: PromptBudgets,
     existing_titles: &[String],
+) -> ChatRequest {
+    build_request_with_residue(
+        session_id,
+        observations,
+        current_body,
+        instructions,
+        budgets,
+        existing_titles,
+        false,
+    )
+}
+
+fn build_request_with_residue(
+    session_id: SessionId,
+    observations: &[Observation],
+    current_body: &str,
+    instructions: Option<&str>,
+    budgets: PromptBudgets,
+    existing_titles: &[String],
+    verbatim_residue: bool,
 ) -> ChatRequest {
     // Stable prefix first so prefix-caching providers can reuse it across
     // sessions of the same project: the project instructions lead, then the
@@ -1354,7 +1431,8 @@ fn build_request(
             MAX_PROJECTED_OBSERVATIONS,
             MAX_PROJECTED_OBSERVATION_BODY_CHARS,
         )
-        .with_context_label("single-page consolidation"),
+        .with_context_label("single-page consolidation")
+        .with_verbatim_residue(verbatim_residue),
     );
     let mut buf = String::new();
     buf.push_str(&instructions_block);
@@ -3776,7 +3854,7 @@ mod tests {
 
     #[test]
     fn batch_relations_schema_uses_the_closed_vocabulary() {
-        let request = build_batch_request(SessionId::new(), &[]);
+        let request = build_batch_request(SessionId::new(), &[], false);
         assert!(request.messages[0].content.contains("- \"relations\""));
         let schema = serde_json::to_value(schemars::schema_for!(ConsolidatedBatch)).unwrap();
         let update = &schema["$defs"]["ConsolidatedPageUpdate"];
@@ -5020,6 +5098,78 @@ mod tests {
 
         let bad = wiki.read_page(ws, proj, &sanitized_path).unwrap();
         assert_eq!(bad.frontmatter["title"], "Bad path page");
+    }
+
+    /// A batch page whose path `slugify_page_path` cannot repair (leading
+    /// slash, dot segment, empty segment) is skipped on its own: before the
+    /// fix `PagePath::new` rejected it inside `build_update` and the `?`
+    /// failed the whole batch, losing the sibling valid page (#848).
+    #[tokio::test]
+    async fn batch_with_unrepairable_path_skips_only_that_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "rationale": "three bad paths, one good",
+            "updates": [
+                {
+                    "path": "/concepts/absolute.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Absolute path page",
+                    "body_markdown": "Absolute path body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/../escape.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Dot segment page",
+                    "body_markdown": "Dot segment body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts//double.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Empty segment page",
+                    "body_markdown": "Empty segment body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/good.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Good path page",
+                    "body_markdown": "Good path body.",
+                    "tags": []
+                }
+            ]
+        });
+
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("an unrepairable path must not fail the whole batch");
+
+        let paths: Vec<&str> = outcomes.iter().map(|o| o.path.as_str()).collect();
+        assert_eq!(paths, vec!["concepts/good.md"]);
+        let good = wiki
+            .read_page(ws, proj, &PagePath::new("concepts/good.md").unwrap())
+            .unwrap();
+        assert_eq!(good.frontmatter["title"], "Good path page");
     }
 
     /// A batch whose single update targets `path` — the model chooses this

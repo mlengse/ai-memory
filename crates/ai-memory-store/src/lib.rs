@@ -88,15 +88,16 @@ pub use reader::{
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
     GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
     ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview,
-    PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
+    PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter, PageHit, PageHitWithMeta,
+    PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
     ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
     ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
-    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
-    SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionSummary, SettledPage, StatusCounts, StorageStatus,
-    StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, SESSION_LINE_TITLE_CHARS,
+    SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain, SessionConsolidationQueue,
+    SessionConsolidationSummary, SessionDependentRows, SessionEndDisposition, SessionKindSummary,
+    SessionLine, SessionObservationSnapshot, SessionSummary, SessionToolTitles, SettledPage,
+    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -132,6 +133,14 @@ pub const CLIENT_ACTIVITY_OVERFLOW_CLIENT: &str = "other";
 /// Default soft cap for the read-only connection pool.
 const READER_POOL_SOFT_CAP: usize = 4;
 
+/// Size the `-wal` file is truncated back to after a checkpoint (`PRAGMA
+/// journal_size_limit`). SQLite's default keeps the file at its high-water
+/// mark forever, so one large transaction (a `VACUUM`, a backfill, a bulk
+/// import) leaves a `-wal` as big as the database, and a crash then replays it
+/// in full on the next start. This does not cap a running transaction: the WAL
+/// still grows as far as that transaction needs.
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// Open (and migrate) a [`Store`] rooted at the given data directory.
 pub struct Store {
     /// Cloneable handle to submit mutations.
@@ -157,6 +166,7 @@ impl Store {
 
         let mut conn = Connection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
 
@@ -214,6 +224,23 @@ impl Store {
     #[must_use]
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// Release the database for process exit: close the read pool (idle
+    /// connections dropped, later reads refused with
+    /// [`StoreError::ReaderClosed`], a read still running dropping its
+    /// connection on return), then have the writer run a final
+    /// `wal_checkpoint(TRUNCATE)`, close its connection and stop.
+    ///
+    /// The server exits without joining the writer thread (detached tasks keep
+    /// clones of [`WriterHandle`] alive), so without this a stop leaves the
+    /// whole `-wal` behind for the next start to replay. Best effort: a
+    /// checkpoint held back by a reader is logged, not returned, and commands
+    /// sent afterwards fail with [`StoreError::WriterClosed`]. Wrap the call in
+    /// a timeout; it waits behind whatever the writer is running.
+    pub async fn close(&self) {
+        self.reader.close();
+        self.writer.checkpoint_and_close().await;
     }
 }
 
@@ -1929,6 +1956,47 @@ mod tests {
         );
     }
 
+    /// The brief's L0/L1 excerpts come from the frontmatter the core rows
+    /// carry, A2-compacted pages included.
+    #[tokio::test]
+    async fn session_brief_pages_carry_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        let mut summarized = sample_page(ws, proj, "_rules/a-summarized.md", "full body");
+        summarized.frontmatter_json =
+            serde_json::json!({"abstract": "one-line pointer", "summary": "longer summary"});
+        store.writer.upsert_page(summarized).await.unwrap();
+        let mut compacted = sample_page(ws, proj, "_rules/b-compacted.md", "L1 line");
+        compacted.frontmatter_json = serde_json::json!({"compacted": true});
+        store.writer.upsert_page(compacted).await.unwrap();
+
+        let (core, _) = store
+            .reader
+            .session_brief_pages(ws, proj, 24, 10)
+            .await
+            .unwrap();
+        let by_path = |path: &str| core.iter().find(|p| p.path == path).unwrap();
+
+        let summarized = by_path("_rules/a-summarized.md");
+        assert_eq!(summarized.frontmatter_json["abstract"], "one-line pointer");
+        assert_eq!(summarized.frontmatter_json["summary"], "longer summary");
+        assert_eq!(
+            by_path("_rules/b-compacted.md").frontmatter_json["compacted"],
+            true
+        );
+    }
+
     #[tokio::test]
     async fn cross_project_links_surface_in_graph_briefing_and_lint() {
         let tmp = TempDir::new().unwrap();
@@ -2449,7 +2517,7 @@ mod tests {
 
         let global = store
             .reader
-            .search_pages_with_meta(query.into(), 10, None, None)
+            .search_pages_with_meta(query.into(), 10, None, None, crate::PageFilter::default())
             .await
             .unwrap();
         assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
@@ -5787,10 +5855,68 @@ mod tests {
             .await
             .unwrap();
         assert!(codex.native_session_id.is_none());
+        assert_eq!(
+            codex.previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            })
+        );
         assert!(
             !codex.may_adopt_existing_session,
             "an established Claude workstream must start a fresh Codex session"
         );
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(codex.run_id, AgentKind::Codex, "codex-native")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_context(codex.run_id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            }),
+            "linking the destination must not replace the pinned source"
+        );
+        store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: codex.run_id,
+                    native_session_id: Some("codex-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+        let same_harness = store
+            .writer
+            .prepare_workstream_run(prepare(AgentKind::Codex, "codex-again"))
+            .await
+            .unwrap();
+        assert!(same_harness.previous_native_session.is_none());
     }
 
     #[tokio::test]
