@@ -49,6 +49,11 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Claude Code otherwise gives SessionEnd hooks a 1.5-second shared budget.
+/// A settings-file timeout raises that budget (up to Claude's 60-second cap),
+/// leaving room for a slow local spool fsync without making other hooks wait.
+pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
+
 /// Kimi Code lifecycle events ai-memory hooks. Claude Code's 9-event
 /// vocabulary (`CLAUDE_CODE_EVENTS`) plus `PostToolUseFailure`: Kimi Code
 /// fires `PostToolUse` on successful calls only and reports failures
@@ -176,6 +181,52 @@ pub(crate) const IBM_BOB_EVENTS: [(&str, &str); 5] = [
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("Stop", "stop.sh"),
+];
+
+/// DeepSeek Harness (DSH) lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-the-Claude-Code-hooks.json, POSIX hook-script-filename)`.
+///
+/// DSH has no native hook protocol: capture runs through the official
+/// `@deepseek-ai/dsh-hooks-claude-code` bridge, which consumes a Claude Code
+/// `hooks.json` and delivers exactly these seven events — `PreCompact` and
+/// `SessionEnd` are not delivered, and `SessionStart` runs detached, so the
+/// bundle never fetches a handoff and finished sessions close with
+/// `ai-memory finalize-session --agent dsh`. Adding a hook event means
+/// updating this list AND adding the matching `.sh` and `.ps1` files under
+/// `hooks/dsh/`; the install-hooks parity test fails if the bundle drifts.
+pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// Qwen Code lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.qwen/settings.json, native hook-event script stem)`;
+/// Qwen has no script bundle, so the `.sh` name only carries the event
+/// token the native command is rendered with.
+///
+/// Qwen Code's hook vocabulary is Claude Code's plus `PostToolUseFailure`
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+/// `PostToolUseFailure` fires instead of `PostToolUse` when a tool throws
+/// and is aliased to `post-tool-use`. Subagent events are included: Qwen
+/// documents `SubagentStart`/`SubagentStop` for user-spawned agents
+/// (`Bash`, `Explorer`, `Plan`). Qwen fires a real `SessionEnd`, so no
+/// `finalize-session` step is needed.
+pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
 ];
 
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
@@ -623,7 +674,7 @@ function captureDecide(tool: CaptureTool, config: CaptureConfig): CaptureDisposi
 const captureRank: Record<CaptureDisposition, number> = { keep: 0, "metadata-only": 1, drop: 2 };
 // Every other marker governing a path the call names (a file-tool target or the files an `apply_patch` names, a search/list directory, file or path-like glob argument, or a shell argument with a separator resolved from its workdir, plus that directory) inspects it too, so a checkout's `ignore_paths` hold for a call made from elsewhere. Lexical; each directory is looked up once and remembered for every lookup that passes it; a glob location is looked up from its literal root (before the walk, whose one listing may spend the time budget) and, when that root lies outside the event's own checkout, every directory it could pass through is checked for a marker of its own; a glob whose `..` follows a `**` is looked up in every reading. Locations outside the own checkout come first: there unreadable targets, glob syntax the walk cannot follow, and anything past the bounds are unprovable, while running out of budget inside the own checkout ends the lookup. Mirrors `capture_lookup_locations` and `foreign_capture_decision`.
 function captureForeignConfigs(tool: CaptureTool, config: CaptureConfig, cwd: string | undefined, own: string | undefined): CaptureConfig[] { const invalid: CaptureConfig[] = [{ state: "invalid", patterns: [], base: config.base, windowsHost: config.windowsHost }]; const locations = new Set<string>(); let overflow = false; const add = (path: string, base: string): string[] | undefined => { const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(path); if (!absolute && !base) return undefined; const readings = captureAllReadings(captureResolve(path, base, config.windowsHost), config.windowsHost); if (readings === false) { overflow = true; return undefined; } if (!readings) return undefined; return readings.map((candidate) => { const location = candidate.windows ? candidate.path.replace(/\//g, "\\") : candidate.path; locations.add(location); return location; }); }; if (tool.family === "file") { const paths = tool.paths ?? tool.patch; if (!paths) return invalid; for (const path of paths) if (add(path, config.base) === undefined) return invalid; } else if (tool.family === "search-list") { if (!tool.search) return invalid; const roots: string[] = []; for (const root of tool.search.roots) { const found = add(root, config.base); if (found === undefined) return invalid; roots.push(...found); } if (!roots.length) roots.push(config.base); for (const pattern of tool.search.patterns.filter((p) => /[\/\\]/.test(p))) for (const root of roots) if (add(pattern, root) === undefined) return invalid; } else if (tool.family === "non-file" && tool.command !== undefined) { if (captureCommandOversized(tool.command)) return invalid; const base = captureBase(config, tool.workdir); if (base) add(base, base); const home = homedir(); const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); for (const [word, tilde] of [...split.words, ...split.expanded]) for (const [argument] of captureShellArguments(word)) { const expanded = captureExpandTilde(argument, tilde, home, base); if (/[\/\\]/.test(expanded)) add(expanded, base); } } if (overflow || locations.size > CAPTURE_MAX_LOOKUP_LOCATIONS) return invalid; const markers: string[] = []; const memo: CaptureMarkerMemo = { governing: new Map(), checkouts: new Map() }; let checkout: string | undefined; if (cwd) { const root = captureMemoCheckout(resolve(cwd), memo, { dirs: 0, entries: 0, deadline: Infinity, now: Date.now, probes: -Infinity }); checkout = root && captureOwnCheckout(root) ? root : undefined; captureMemoRemember(cwd, own, memo); if (statSync(resolve(cwd), { throwIfNoEntry: false })?.isDirectory()) captureMemoNote(cwd, memo); } const budget: CaptureGlobBudget = { dirs: 0, entries: 0, deadline: captureNow() + CAPTURE_MAX_GLOB_MS, now: captureNow, probes: 0 }; const remember = (marker: string | undefined): boolean => { if (!marker || marker === own || markers.includes(marker)) return true; if (markers.length === CAPTURE_MAX_FOREIGN_MARKERS) return false; markers.push(marker); return true; }; const insideOwn = (location: string) => checkout !== undefined && (location === checkout || location.startsWith(join(checkout, "x").slice(0, -1))); const ordered = [...locations].filter((location) => !insideOwn(location)); const insideFrom = ordered.length; ordered.push(...[...locations].filter(insideOwn).sort((a, b) => a.split(/[\\/]/).length - b.split(/[\\/]/).length)); for (let index = 0; index < ordered.length; index++) { const location = ordered[index]; const walk = captureGlobWalk(location); if (walk === undefined) return invalid; const lookup = walk ? walk.root : location; const dir = captureExistingDirWithin(lookup, memo, budget); if (dir === undefined) { if (index >= insideFrom) break; return invalid; } const marker = dir === null ? null : captureMemoMarker(dir, memo, budget); if (marker === undefined) { if (index >= insideFrom) break; return invalid; } if (!remember(marker ?? undefined)) return invalid; if (walk) { const found = captureMarkersBelow(walk.root, walk.steps, checkout, budget); if (!found) return invalid; for (const marker of found) if (!remember(marker)) return invalid; } } return markers.map((marker) => captureConfigAt(marker, cwd)); }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } if (config.state === "inactive") return { disposition, payload }; const extraction = config.state === "active" && tool.family === "search-list" ? "not-applicable" : tool.extraction === "not-applicable" ? "extracted" : tool.extraction; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
 "##;
     let names = |names: &[&str]| {
         let quoted: Vec<String> = names.iter().map(|name| ts_string_literal(name)).collect();
@@ -680,7 +731,7 @@ pub(crate) fn build_claude_code_payload(
     server_url: &str,
     auth_token: Option<&str>,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -692,7 +743,7 @@ pub(crate) fn build_claude_code_payload(
             None,
             None,
         ),
-    )
+    ))
 }
 
 pub(crate) fn build_claude_code_payload_with_data_dir(
@@ -743,7 +794,7 @@ fn build_claude_code_payload_with_data_dir_for_platform(
     capture_assistant: bool,
     platform: HookCommandPlatform,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -752,7 +803,20 @@ fn build_claude_code_payload_with_data_dir_for_platform(
         HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
             .allow_claude_windows_exec()
             .with_capture_assistant(capture_assistant),
-    )
+    ))
+}
+
+fn with_claude_session_end_timeout(mut payload: Value) -> Value {
+    if let Some(handler) = payload
+        .pointer_mut("/hooks/SessionEnd/0/hooks/0")
+        .and_then(Value::as_object_mut)
+    {
+        handler.insert(
+            "timeout".into(),
+            Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS),
+        );
+    }
+    payload
 }
 
 /// Grok Build CLI hook payload for docker/setup-agent script snippets.
@@ -776,6 +840,36 @@ pub(crate) fn build_grok_payload(
             "grok",
             None,
             None,
+        ),
+    )
+}
+
+/// DeepSeek Harness (DSH) hook payload: a Claude Code `hooks.json` document
+/// the official `@deepseek-ai/dsh-hooks-claude-code` bridge consumes via its
+/// `configPath` setting. Commands are rendered for the current platform
+/// (native `ai-memory hook --event … --agent dsh` commands by default, so
+/// capture gets the local spool and capture-policy v1 enforcement; script
+/// commands under an `AI_MEMORY_HOOK_PLATFORM` override). The payload only
+/// covers [`DSH_EVENTS`] — no `PreCompact` or `SessionEnd`.
+#[must_use]
+pub(crate) fn build_dsh_hooks_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DSH_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::current(),
+            "dsh",
+            data_dir,
+            project_strategy,
         ),
     )
 }
@@ -950,25 +1044,61 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 /// (same reasoning as Kiro v2's `max_output_size`).
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Hermes Agent lifecycle events ai-memory hooks. Each pair is
+/// Hermes Agent tool events ai-memory hooks. Each pair is
 /// `(event-name-in-~/.hermes/config.yaml, native `hook --event` value)`.
 ///
-/// Verified against Hermes v0.21.4 (`agent/shell_hooks.py`): a configured
+/// Verified against Hermes v0.22.2 (`agent/shell_hooks.py`): a configured
 /// `command` is split into argv by `shlex.split` and executed **without a
 /// shell**, with the event JSON on stdin — so the generated block invokes the
 /// native `hook` subcommand, the same shape Zero and ZCode use, and no
-/// `.sh`/`.ps1` bundle is staged. Only the two tool events are wired: their
-/// payload carries `tool_name` / `tool_input`, the envelope the router already
-/// maps for `agent=hermes`. Session lifecycle stays with the memory-provider
-/// plugin (`on_session_end`), so a hook-driven `session-end` cannot
-/// double-close a Hermes session.
-pub(crate) const HERMES_EVENTS: [(&str, &str); 2] = [
+/// `.sh`/`.ps1` bundle is staged. Hermes fires a shell hook for every event it
+/// defines, with one stdin envelope (`hook_event_name`, `tool_name`,
+/// `tool_input`, `session_id`, `cwd`, `extra`).
+pub(crate) const HERMES_TOOL_EVENTS: [(&str, &str); 2] = [
     ("pre_tool_call", "pre-tool-use"),
     ("post_tool_call", "post-tool-use"),
 ];
 
+/// Hermes session lifecycle events, mapped by meaning rather than name:
+///
+/// - `on_session_start` fires on a new session's first turn. Hermes ignores
+///   its stdout, so it only records the start; the handoff is never fetched
+///   there, because that fetch claims it.
+/// - `pre_llm_call` fires before every turn with the prompt in
+///   `extra.user_message`. Its `{"context": ...}` stdout carries any pending
+///   handoff into the turn, including after a native Hermes session resumes.
+/// - `on_session_end` fires at the end of **every turn**, not of the session,
+///   so it is a turn boundary (`stop`).
+/// - `on_session_finalize` is the real end: CLI exit, `/new`, gateway
+///   shutdown. A gateway session that expires idle is never finalized, which
+///   `ai-memory finalize-session --agent hermes` covers.
+///
+/// `post_llm_call` (assistant text) and `subagent_*` are not wired: assistant
+/// capture is native-only, and a delegated child is not a session of its own.
+pub(crate) const HERMES_LIFECYCLE_EVENTS: [(&str, &str); 4] = [
+    ("on_session_start", "session-start"),
+    ("pre_llm_call", "user-prompt-submit"),
+    ("on_session_end", "stop"),
+    ("on_session_finalize", "session-end"),
+];
+
+/// Which Hermes events the generated `hooks:` block wires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HermesHookSet {
+    /// Tool and lifecycle events: ai-memory owns the whole Hermes session.
+    Full,
+    /// Tool events only. The community ai-memory memory-provider plugin
+    /// already posts prompts and session ends and claims the handoff, so a
+    /// second lifecycle path would capture each prompt twice and race it for
+    /// the handoff.
+    ToolsOnly,
+}
+
 /// Wall-clock bound written into each Hermes hook entry. Capture POSTs are
-/// fire-and-forget, so this only bounds a hung `hook` invocation.
+/// fire-and-forget and the prompt-time handoff fetch has its own short
+/// timeout, so this only bounds a hung `hook` invocation. Hermes bounds a
+/// blocking hook's callback at 30 s by default, and `pre_llm_call` holds
+/// the turn while it runs, so the entry stays well under that.
 pub(crate) const HERMES_HOOK_TIMEOUT_SECONDS: u64 = 20;
 
 /// The ready-to-paste `hooks:` block for `~/.hermes/config.yaml`.
@@ -986,6 +1116,7 @@ pub(crate) fn build_hermes_hooks_yaml(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    hook_set: HermesHookSet,
 ) -> String {
     build_hermes_hooks_yaml_for_platform(
         server_url,
@@ -996,7 +1127,18 @@ pub(crate) fn build_hermes_hooks_yaml(
             data_dir,
             project_strategy,
         ),
+        hook_set,
     )
+}
+
+/// The events [`build_hermes_hooks_yaml`] wires for `hook_set`, tool events
+/// first.
+pub(crate) fn hermes_events(hook_set: HermesHookSet) -> Vec<(&'static str, &'static str)> {
+    let mut events = HERMES_TOOL_EVENTS.to_vec();
+    if hook_set == HermesHookSet::Full {
+        events.extend(HERMES_LIFECYCLE_EVENTS);
+    }
+    events
 }
 
 /// Platform-forced variant, so a test can pin POSIX/Windows instead of
@@ -1005,9 +1147,10 @@ fn build_hermes_hooks_yaml_for_platform(
     server_url: &str,
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
+    hook_set: HermesHookSet,
 ) -> String {
     let mut out = String::from("hooks:\n");
-    for (hermes_event, our_event) in HERMES_EVENTS {
+    for (hermes_event, our_event) in hermes_events(hook_set) {
         // The native platforms derive the event token from the script stem, so
         // the synthetic filename carries the ai-memory event name.
         let command = hook_command(
@@ -1220,6 +1363,35 @@ pub(crate) fn build_ibm_bob_hooks_payload(
         HookCommandContext::new(
             HookCommandPlatform::native(),
             "ibm-bob",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Qwen Code's `~/.qwen/settings.json`. The
+/// `hooks` key holds Claude Code's nested shape (`"Event": [{"matcher": "",
+/// "hooks": [{"type": "command", "command": …}]}]`). Qwen runs each
+/// `command` with the Claude Code-shaped event JSON on stdin
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>),
+/// so every entry invokes the native `ai-memory hook` command; there is no
+/// script bundle. An empty matcher fires on every tool and every
+/// SessionStart source.
+pub(crate) fn build_qwen_code_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &QWEN_CODE_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "qwen-code",
             data_dir,
             project_strategy,
         ),
@@ -1445,8 +1617,16 @@ pub(crate) const ANTIGRAVITY_TOOL_EVENTS: [(&str, &str); 2] = [
     ("PostToolUse", "post-tool-use.sh"),
 ];
 
-pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
-    [("PreInvocation", "session-start.sh"), ("Stop", "stop.sh")];
+/// `SessionStart` starts a conversation and delivers the handoff.
+/// `PreInvocation` fires before every model call; its invocation zero starts
+/// a user turn, where the native hook recovers the turn's prompts from the
+/// transcript, and stands in for `SessionStart` on builds that have none.
+/// `Stop` ends one execution loop; a finished, idle one is a turn checkpoint.
+pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 3] = [
+    ("SessionStart", "session-start.sh"),
+    ("PreInvocation", "pre-invocation.sh"),
+    ("Stop", "stop.sh"),
+];
 
 /// Build the Antigravity CLI (`agy`) `hooks.json` payload.
 ///
@@ -1454,8 +1634,8 @@ pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
 /// maps hook-group names to their event configurations. Each group
 /// can contain any subset of the supported events. Tool events
 /// (`PreToolUse`, `PostToolUse`) use the nested shape with matcher;
-/// lifecycle events (`PreInvocation`, `Stop`) use a flat handler
-/// list where matcher is ignored.
+/// lifecycle events (`SessionStart`, `PreInvocation`, `Stop`) use a flat
+/// handler list where matcher is ignored.
 ///
 /// The output is `{ "ai-memory": { <events> } }`.
 pub(crate) fn build_antigravity_payload_with_data_dir(
@@ -2193,44 +2373,8 @@ fn hook_command(
             // out; double quotes + the native Windows path work in cmd.exe and
             // Git Bash. The event name is a fixed slug with no shell
             // metacharacters, so it is left unquoted.
-            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
-            let event = script
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            // Antigravity's executor wraps the whole command in `cmd /c "…"`
-            // and does not strip inner quotes, so it needs the bare form
-            // (#611); every other Windows agent keeps the double-quoted form.
-            let bare = windows_hook_command_is_bare(context.agent);
-            let quote = if bare {
-                NativeQuote::WindowsBare
-            } else {
-                NativeQuote::Windows
-            };
-            let quote_field = |s: &str| {
-                if bare {
-                    s.to_string()
-                } else {
-                    win_double_quote(s)
-                }
-            };
-            let mut cmd = format!(
-                "{}{}{} hook --event {event} --agent {agent} --server-url {}",
-                powershell_call_operator(context.agent),
-                quote_field(&exe),
-                native_data_dir_arg(context.data_dir, quote),
-                quote_field(server_url),
-                agent = context.agent,
-            );
-            if let Some(t) = auth_token {
-                cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
-            }
-            cmd.push_str(&native_project_strategy_arg(
-                context.project_strategy,
-                quote,
-            ));
-            cmd.push_str(native_capture_assistant_arg(context, event));
-            cmd
+            let exe = hook_embedded_exe_path();
+            windows_native_hook_command_with_exe(&exe, script, server_url, auth_token, context)
         }
         HookCommandPlatform::PosixNative => {
             // Native POSIX (opt-in): invoke the binary directly so the hook
@@ -2268,6 +2412,53 @@ fn powershell_encoded_command(program: &str) -> String {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     base64::engine::general_purpose::STANDARD.encode(utf16_le)
+}
+
+fn windows_native_hook_command_with_exe(
+    exe: &Path,
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let exe = exe.to_string_lossy();
+    let event = script
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    // Antigravity's executor wraps the whole command in `cmd /c "…"` and
+    // does not strip inner quotes, so it needs the bare form (#611); every
+    // other Windows agent keeps the double-quoted form.
+    let bare = windows_hook_command_is_bare(context.agent);
+    let quote = if bare {
+        NativeQuote::WindowsBare
+    } else {
+        NativeQuote::Windows
+    };
+    let quote_field = |s: &str| {
+        if bare {
+            s.to_string()
+        } else {
+            win_double_quote(s)
+        }
+    };
+    let mut cmd = format!(
+        "{}{}{} hook --event {event} --agent {agent} --server-url {}",
+        powershell_call_operator(context.agent),
+        quote_field(&exe),
+        native_data_dir_arg(context.data_dir, quote),
+        quote_field(server_url),
+        agent = context.agent,
+    );
+    if let Some(t) = auth_token {
+        cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
+    }
+    cmd.push_str(&native_project_strategy_arg(
+        context.project_strategy,
+        quote,
+    ));
+    cmd.push_str(native_capture_assistant_arg(context, event));
+    cmd
 }
 
 fn windows_native_exec_spec(
@@ -2445,7 +2636,15 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // Grok 1.0.41: every ai-memory hook failed with a ParserError in the
     // session's `hook_execution` updates, and its hooks guide documents the
     // PowerShell `$VAR` rewrite).
-    if matches!(agent, "codex" | "grok") {
+    // Copilot CLI selects the `command` fallback as its PowerShell command on
+    // Windows; without `&`, its quoted executable is only a string expression
+    // and every fail-closed PreToolUse hook denies the tool (#1462).
+    // Gemini CLI has run every hook command through PowerShell `-Command` on
+    // Windows since 0.23.0 (google-gemini/gemini-cli#15343: `HookRunner`
+    // spawns `getShellConfiguration()`). A command that fails to parse exits
+    // 1, which Gemini treats as a non-blocking error, so the session runs on
+    // and captures nothing (#1484).
+    if matches!(agent, "codex" | "grok" | "copilot-cli" | "gemini-cli") {
         "& "
     } else {
         ""
@@ -2454,6 +2653,17 @@ fn powershell_call_operator(agent: &str) -> &'static str {
 
 fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
+}
+
+#[test]
+fn powershell_call_operator_is_limited_to_known_powershell_runners() {
+    for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
+        assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
+    }
+
+    for agent in ["claude-code", "kiro-cli", "opencode", "qwen-code"] {
+        assert_eq!(powershell_call_operator(agent), "", "agent: {agent}");
+    }
 }
 
 /// #515: Codex evaluates its Windows hook command with PowerShell, where a
@@ -2488,6 +2698,141 @@ fn grok_windows_command_invokes_rather_than_quotes() {
     assert!(
         cmd.starts_with("& \""),
         "grok must use the call operator: {cmd}"
+    );
+}
+
+/// Copilot CLI evaluates its Windows `command` fallback in PowerShell. A
+/// quoted executable therefore needs the call operator, including when its
+/// path and data directory contain spaces.
+#[test]
+fn copilot_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = windows_native_hook_command_with_exe(
+        Path::new(r"C:\Program Files\ai-memory\ai-memory.exe"),
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\Users\Alice Smith\ai-memory")),
+            None,
+        ),
+    );
+    assert!(
+        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        "Copilot must invoke the quoted executable through PowerShell: {cmd}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn copilot_cli_windows_command_executes_in_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\data dir|hook|--event|pre-tool-use|--agent|copilot-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { exit 9 }
+"#,
+    )
+    .unwrap();
+    let command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\data dir")),
+            None,
+        ),
+    );
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Copilot hook command failed in PowerShell: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Gemini CLI runs its Windows hook commands through PowerShell `-Command`,
+/// so a quoted executable needs the call operator, including when its path
+/// and data directory contain spaces.
+#[test]
+fn gemini_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = windows_native_hook_command_with_exe(
+        Path::new(r"C:\Program Files\ai-memory\ai-memory.exe"),
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\Users\Alice Smith\ai-memory")),
+            None,
+        ),
+    );
+    assert!(
+        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        "Gemini must invoke the quoted executable through PowerShell: {cmd}"
+    );
+}
+
+/// Runs the command the way Gemini CLI does: PowerShell `-Command`, with the
+/// exit-code check Gemini appends to every PowerShell hook command.
+#[cfg(windows)]
+#[test]
+fn gemini_cli_windows_command_executes_in_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\data dir|hook|--event|session-start|--agent|gemini-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { exit 9 }
+"#,
+    )
+    .unwrap();
+    let mut command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\data dir")),
+            None,
+        ),
+    );
+    command.push_str("; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Gemini hook command failed in PowerShell: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -2690,7 +3035,10 @@ async function drainHookSpool(): Promise<void> {
         "X-AI-Memory-Client": AGENT,
       };
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
+      // Bun reads HTTP(S)_PROXY and ALL_PROXY even for a loopback URL;
+      // `proxy: false` connects directly. Node's fetch ignores the key.
       const resp = await fetch(entry.url, {
+        proxy: false,
         method: "POST",
         headers,
         body: entry.body,
@@ -2819,6 +3167,13 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
                 || call.contains("mcpHeaders(")
                 || call.contains("        headers,\n"),
             "{name}: a fetch without the client marker:\n{call}"
+        );
+        // Bun's fetch sends even a loopback request through an environment
+        // proxy, which a sandbox with an empty NO_PROXY (ai-jail) answers
+        // with a 4xx; the native hook and the shell bundle skip proxies too.
+        assert!(
+            call.contains("proxy: false,"),
+            "{name}: a fetch that can reach an environment proxy:\n{call}"
         );
     }
     assert!(
@@ -3249,6 +3604,8 @@ emit({{ tool: "edit", args: {{ path: privatePath, nested: {{ body: privateBody }
 const malformedRequest = requests.at(-1) ?? "";
 const malformedQueued = JSON.stringify(queue.at(-1));
 check(JSON.parse(malformedRequest)._ai_memory_capture?.policy_state === "invalid", "malformed-quote-invalid-protocol");
+const invalidSearch = capturePolicy({{ tool: "grep", args: {{ pattern: "x" }} }}, malformedQuoteCwd);
+check(invalidSearch.protocol?.policy_state === "invalid" && invalidSearch.protocol.extraction_state === "extracted", "invalid-search-extraction-parity");
 for (const forbidden of [privatePath, privateBody]) check(!malformedQueued.includes(forbidden) && !malformedRequest.includes(forbidden), "malformed-quote-redaction");
 emit({{ tool: "edit", args: {{ path: "C:relative", nested: {{ path: privatePath, body: privateBody }} }}, output: privateBody, error: privateBody, sessionID: "session-safe", cwd: "/cwd-safe", tool_call_id: "call-safe" }}, gatedCwd);
 const metadata = requests.at(-1) ?? "";
@@ -3263,6 +3620,8 @@ for (const forbidden of [privatePath, privatePattern, privateBody]) check(!metad
 const inactivePayload = {{ tool: "edit", args: {{ path: privatePath }}, output: privateBody }};
 const inactive = capturePolicy(inactivePayload, "/no-marker");
 check(inactive.disposition === "keep" && inactive.payload === inactivePayload && !inactive.protocol, "inactive-preserves-object");
+const activeSearch = capturePolicy({{ tool: "grep", args: {{ pattern: "x" }} }}, gatedCwd);
+check(activeSearch.protocol?.policy_state === "active" && activeSearch.protocol.extraction_state === "not-applicable", "active-search-not-applicable");
 const activeKeep = capturePolicy({{ tool: "bash", args: {{ command: privateBody }} }}, gatedCwd);
 check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 && activeKeep.protocol.policy_state === "active", "active-keep-adds-protocol");
 // Windows spellings of an ignored file, and the POSIX sessions they must not touch (shared vectors; mirrors `windows_spelling_fixture_vectors`).
@@ -3516,6 +3875,14 @@ if (inheritOnly) {
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }
+        assert_eq!(
+            v.pointer("/hooks/SessionEnd/0/hooks/0/timeout"),
+            Some(&Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS))
+        );
+        assert!(
+            v.pointer("/hooks/PostToolUse/0/hooks/0/timeout").is_none(),
+            "only the cancellation-prone SessionEnd budget is raised"
+        );
     }
 
     #[test]
@@ -3968,24 +4335,53 @@ if (inheritOnly) {
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
     }
 
-    /// The public entry point must emit a complete `hooks:` map with both tool
-    /// events, whatever platform it renders for (the suite runs on Windows too).
+    /// The public entry point must emit a complete `hooks:` map, whatever
+    /// platform it renders for (the suite runs on Windows too): every tool and
+    /// lifecycle event in full, the tool events alone beside the plugin.
     #[test]
-    fn hermes_hooks_yaml_covers_both_tool_events() {
-        let yaml = build_hermes_hooks_yaml("http://127.0.0.1:49374", None, None, None);
-        assert!(yaml.starts_with("hooks:\n"));
-        for (event, _) in HERMES_EVENTS {
-            assert!(yaml.contains(&format!("  {event}:\n")), "missing {event}");
-            assert!(
-                yaml.contains("    - command: '"),
-                "command must be a single-quoted YAML scalar"
+    fn hermes_hooks_yaml_wires_the_full_lifecycle_or_the_tool_events_only() {
+        let full = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::Full,
+        );
+        let tools = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::ToolsOnly,
+        );
+        for (yaml, events) in [
+            (&full, hermes_events(HermesHookSet::Full)),
+            (&tools, hermes_events(HermesHookSet::ToolsOnly)),
+        ] {
+            assert!(yaml.starts_with("hooks:\n"));
+            for (event, _) in &events {
+                assert!(yaml.contains(&format!("\n  {event}:\n")), "missing {event}");
+            }
+            assert_eq!(yaml.matches("    - command: '").count(), events.len());
+            assert_eq!(
+                yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
+                    .count(),
+                events.len()
             );
         }
+        assert_eq!(hermes_events(HermesHookSet::Full).len(), 6);
         assert_eq!(
-            yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
-                .count(),
-            HERMES_EVENTS.len()
+            hermes_events(HermesHookSet::ToolsOnly),
+            HERMES_TOOL_EVENTS.to_vec()
         );
+        for (event, our_event) in HERMES_LIFECYCLE_EVENTS {
+            assert!(!tools.contains(event), "{event} must stay with the plugin");
+            assert!(!tools.contains(&format!("--event {our_event} ")));
+        }
+        // Assistant text is native-only, and subagents are not sessions.
+        for unwired in ["post_llm_call", "subagent_start", "subagent_stop"] {
+            assert!(!full.contains(unwired), "{unwired}");
+        }
     }
 
     /// Hermes splits `command` with `shlex.split` and runs it with no shell, so
@@ -4002,8 +4398,9 @@ if (inheritOnly) {
                 Some(Path::new("/data")),
                 Some("repo-root"),
             ),
+            HermesHookSet::Full,
         );
-        for (_, our_event) in HERMES_EVENTS {
+        for (_, our_event) in hermes_events(HermesHookSet::Full) {
             assert!(
                 yaml.contains(&format!("hook --event {our_event} --agent hermes")),
                 "missing the native command for {our_event}"
@@ -4268,6 +4665,35 @@ if (inheritOnly) {
             assert!(definition.get("matcher").is_none(), "event: {event}");
             let command = definition["hooks"][0]["command"].as_str().unwrap();
             assert!(command.contains("--agent command-code"), "{command}");
+        }
+    }
+
+    #[test]
+    fn qwen_code_profile_uses_nested_native_commands() {
+        let value = build_qwen_code_hooks_payload(
+            "http://memory:49374",
+            None,
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 10);
+        for (event, script) in QWEN_CODE_EVENTS {
+            let definition = &value["hooks"][event][0];
+            assert_eq!(definition["matcher"], "", "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            let event_name = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!("hook --event {event_name} --agent qwen-code")),
+                "{event}: {command}"
+            );
+            let expected_strategy = if cfg!(windows) {
+                r#"--project-strategy "repo-root""#
+            } else {
+                "--project-strategy repo-root"
+            };
+            assert!(command.contains(expected_strategy), "{command}");
+            assert!(!command.contains(".sh"), "{command}");
         }
     }
 
@@ -4570,12 +4996,56 @@ $payload = [Console]::In.ReadToEnd()
             "Stop must record a stop observation, not synthesize session-end handoffs: {stop_cmd}"
         );
 
-        // All expected events present
-        for expected in ["PreToolUse", "PostToolUse", "PreInvocation", "Stop"] {
-            assert!(
-                group.contains_key(expected),
-                "missing Antigravity event {expected}"
-            );
+        // All expected events present, each lifecycle event on its own
+        // script: SessionStart starts the conversation, PreInvocation marks
+        // a turn (and stands in for SessionStart on builds without it).
+        assert_eq!(
+            group.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "PreToolUse",
+                "PostToolUse",
+                "SessionStart",
+                "PreInvocation",
+                "Stop"
+            ]
+        );
+        for (event, script) in [
+            ("SessionStart", "session-start.sh"),
+            ("PreInvocation", "pre-invocation.sh"),
+        ] {
+            let cmd = group[event][0]["command"].as_str().unwrap();
+            // The script path's separator and quoting follow the platform
+            // (`'...\session-start.sh'` on Windows), so compare the file name.
+            let file = cmd
+                .trim_end_matches(['\'', '"'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap();
+            assert_eq!(file, script, "{event}: {cmd}");
+        }
+    }
+
+    /// The native command's event token is the script stem, so the native
+    /// hook tells SessionStart and PreInvocation apart by their tokens.
+    #[test]
+    fn antigravity_native_commands_carry_distinct_start_tokens() {
+        let v = build_antigravity_payload_for_platform(
+            Path::new("/host/hooks/antigravity-cli"),
+            "http://localhost:49374",
+            None,
+            HookCommandPlatform::PosixNative,
+            "antigravity-cli",
+            None,
+            None,
+        );
+        for (event, token) in [
+            ("SessionStart", "--event session-start "),
+            ("PreInvocation", "--event pre-invocation "),
+            ("Stop", "--event stop "),
+        ] {
+            let cmd = v["ai-memory"][event][0]["command"].as_str().unwrap();
+            assert!(cmd.contains(token), "{event}: {cmd}");
+            assert!(cmd.contains("--agent antigravity-cli"), "{event}: {cmd}");
         }
     }
 

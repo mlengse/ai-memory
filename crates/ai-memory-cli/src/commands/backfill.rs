@@ -1804,8 +1804,8 @@ mod tests {
     async fn real_hook_router_replay_is_idempotent_and_reports_outcomes() {
         use ai_memory_core::{ActiveProject, IngestMetrics, Sanitizer, SessionId};
         use ai_memory_hooks::{
-            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
-            hook_router,
+            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore,
+            SubagentSessionSet, hook_router,
         };
         use ai_memory_store::Store;
         use ai_memory_wiki::Wiki;
@@ -1833,6 +1833,7 @@ mod tests {
             ingest_metrics: Arc::new(IngestMetrics::default()),
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
+            cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
@@ -1847,6 +1848,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-with-a-very-long-identifier-that-would-break-the-old-key";
@@ -2004,8 +2006,8 @@ mod tests {
     async fn two_sequential_recovery_intervals_on_one_resumed_session_replay_exactly_once() {
         use ai_memory_core::{ActiveProject, IngestMetrics, ObservationKind, Sanitizer, SessionId};
         use ai_memory_hooks::{
-            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
-            hook_router,
+            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore,
+            SubagentSessionSet, hook_router,
         };
         use ai_memory_store::Store;
         use ai_memory_wiki::Wiki;
@@ -2033,6 +2035,7 @@ mod tests {
             ingest_metrics: Arc::new(IngestMetrics::default()),
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
+            cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
@@ -2047,6 +2050,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-resumed-across-two-offline-intervals";

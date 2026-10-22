@@ -1,12 +1,14 @@
 # Design: tiered L0/L1/L2 SessionStart brief
 
-**Status:** Draft (2026-10-13). Open questions resolved. Eventual path:
-[`docs/design-tiered-session-brief.md`](design-tiered-session-brief.md).
+**Status:** Implemented in 3.1 by PR
+[#1264](https://github.com/akitaonrails/ai-memory/pull/1264); this is the
+design of record. The baseline, rollout, and PR-plan sections below describe
+the proposal as reviewed, not unfinished work. Current behavior is summarized
+in [`ARCHITECTURE.md`](ARCHITECTURE.md#data-flow).
 
-This is the remaining landscape R7 work: consume extractive L0/L1/L2
-tiers on the opted-in SessionStart project brief. Additive rendering on
-the next minor after 3.0.0. Verified against `main` at `dbe928e3`
-(`release: v3.0.0`).
+This completed the remaining landscape R7 work: consume extractive L0/L1/L2
+tiers on the opted-in SessionStart project brief. The proposal baseline was
+verified against `main` at `dbe928e3` (`release: v3.0.0`).
 
 Ideas only from OpenViking's progressive-disclosure tiers and Letta-code
 MemFS directory deferral. Do not vendor either tree (OpenViking is AGPLv3).
@@ -232,7 +234,7 @@ Restated from `AGENTS.md` because they bound the packing:
 5. **Pages shared, batons owned (#16).** The brief does not filter pages
    by `author_id`. Slot visibility stays the existing
    `SlotVisibility::for_viewer` SQL predicate.
-6. **MCP tool count frozen at 23.** No `memory_brief_expand`. Footer
+6. **MCP tool count was frozen at 23 for this proposal.** No `memory_brief_expand`. Footer
    already points at follow-up tools.
 7. **Wiki mutations stay on `Wiki::write_page` / `apply_batch`.** This
    design does not write wiki files. It only reads latest rows.
@@ -562,7 +564,10 @@ first call" policy after coverage without eating the recent share.
 
 1. **L0 coverage.** Walk `core` in store order (`pinned DESC, path ASC`).
    For each page, compute L0 text. If `l0` is `None`, the candidate is
-   a TitleOnly path line. Greedy-fit against
+   a TitleOnly path line. A non-empty body that costs less than its L0
+   (a frontmatter `abstract:` or `summary:` can be longer than the body
+   it describes) is covered at L2 instead, at its own cost (#1360).
+   Greedy-fit against
    `l0_ceiling = content_ceiling - recent_cap - count_only_floor`
    (a candidate fits when `l0_spent + cost(candidate) <= l0_ceiling`).
    If the candidate does not fit, stop. Every later page is `Omitted`.
@@ -584,7 +589,9 @@ first call" policy after coverage without eating the recent share.
 3. **Privileged L2.** For included privileged pages, in order: upgrade
    to full `body.trim()` only when the *entire* L2 fits. Do not
    truncate an L2 in this pass. Truncation of one body is what starves
-   later pages today. If L2 does not fit, the page stays at L1.
+   later pages today. If L2 does not fit, the page stays at L1. A body
+   cheaper than the L1 the page shows always fits: the swap is free and
+   its saving returns to the remainder. This holds in (5) and (6) too.
 4. **Unprivileged L1.** Same as (2) for the remaining included pages.
 5. **Short bodies.** In store order, complete any unprivileged page whose
    whole body is at most `SHORT_BODY_SLACK` (128) bytes more than what it
@@ -888,7 +895,8 @@ must not call it.
 
 ### D. New MCP tool `memory_brief_expand`
 
-Breaks the 23-tool freeze. Duplicates `memory_read_page` (by path) and
+Would have broken the then-current 23-tool freeze. Duplicates
+`memory_read_page` (by path) and
 `memory_query` (by search). The footer already names follow-up. Rejected.
 
 ### E. Persist compiled L0/L1 sidecar files (OpenViking `.abstract.md` / `.overview.md`)

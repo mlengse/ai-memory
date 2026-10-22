@@ -7,6 +7,15 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+When the server runs with `--enable-web`, root can inspect all managed ledgers
+at `/web/workstreams`. The read-only page shows trusted lifecycle state, the
+latest harness/run, current harness links, event counts, and activity times. It
+does not infer "waiting for input" from captured prose, and it never displays
+checkout paths, fingerprints, lease-owner strings, native session ids, source
+record ids, or transcript content. This cross-project operator view is not a
+discovery API: `ai-memory resume` and normal run selection remain restricted to
+the exact repository/worktree fingerprints described below.
+
 `ai-memory run` is the preferred way to start a harness: if in doubt, run
 with ai-memory. Besides session continuity, the first time it launches a given
 harness it auto-installs that harness's ai-memory hooks and MCP if they are
@@ -66,21 +75,26 @@ ai-memory run --profile work omp --profile omp-work
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
 and always selects the Claude harness. The exact spelling never changes
 the agent kind, session store, or transcript import.
-Combine that wildcard with `--executable` to launch the right account's
-binary while keeping each account's managed workstream distinguishable in
-your shell history:
+A `claude*` name other than plain `claude` and `claude-code` also picks the
+binary: when no `--executable` is given and an executable with exactly that
+name is on the launch `PATH` (including a `PATH` set with `--env`), `run`
+launches it. Per-account wrapper scripts therefore work without repeating
+yourself:
 
 ```bash
 # ~/bin/claude-corp and ~/bin/claude-personal are wrapper scripts (earlier on
 # PATH than the bare `claude`) that each exec the real claude binary with
 # that account's config/credentials directory.
-ai-memory run claude-corp --executable claude-corp --model opus
-ai-memory run claude-personal --executable claude-personal
+ai-memory run claude-corp --model opus
+ai-memory run claude-personal
 ```
 
-Only the `--executable` value matters for which binary actually runs; the
-positional name is free-form as long as it starts with `claude`, so pick
-whatever reads clearly to you.
+If no executable with that name exists, `run` prints a warning on stderr and
+starts plain `claude`, so a mistyped or missing wrapper cannot silently put you
+on the wrong account. An explicit `--executable` always wins, and `claude` and
+`claude-code` always mean the plain `claude` binary. The name must be a bare
+command name found through `PATH` (a shell alias or function is invisible
+here); to use a binary elsewhere, pass `--executable <path>`.
 
 ```bash
 cd /path/to/project
@@ -115,6 +129,25 @@ AI_MEMORY_PREVIOUS_SESSION_HISTORY=/private/temp/.../history.md
 
 The startup packet tells the receiving agent to read the file when the user
 asks to continue or an exact detail is absent from the bounded portable packet.
+That server-authored directive is outside the packet's untrusted-history fence;
+only the imported transcript evidence is inside the fence. The canonical
+ai-memory routing block provides the same fallback: when all three
+wrapper-owned variables `AI_MEMORY_RUN_ID`, `AI_MEMORY_WORKSTREAM_ID`, and
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY` are present, "continue", "resume", or
+"pick up where we left off" means to read the named file before inferring the
+unfinished task. This covers quota exhaustion and other abrupt exits where the
+outgoing harness cannot prepare a handoff.
+
+Outside a managed run there is no dossier, but the server still sees the cut-off
+session's captured observations. When the newest work in the project belongs to
+another session of the same operator that never ended and left no handoff after
+that work,
+`GET /handoff` adds a metadata-only notice (agent kind, session id, age) that
+tells the agent to read that session with `memory_read_session_observations`,
+newest first. `memory_briefing` (`recent_sessions`) and `memory_handoff_list`
+(`newer_unended_session`) expose the same pointer to clients whose session start
+injects nothing.
+
 The dossier is evidence, not instructions: it is fenced as untrusted history,
 contains no hidden reasoning or unsupported/private records, and disappears
 when the child exits. The remote ai-memory server never receives its path or
@@ -122,6 +155,21 @@ body. A same-harness resume needs no dossier because that harness resumes its
 own native session. If the prior store is missing, unreadable, on another
 machine, or above the adapter's safety bounds, launch continues with the
 portable ledger and handoff and prints one warning.
+
+If a same-machine harness switch has no
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY`, check the executable used by the exact
+shell that launched it:
+
+```bash
+type -a ai-memory
+ai-memory --version
+```
+
+Native-history continuation requires the 3.1.0 or newer host client. A stale
+Cargo or package-manager binary earlier in `PATH` can shadow an updated Docker
+wrapper and its checksum-verified native runner. Upgrade or remove the
+shadowing executable, then restart the managed run; an already-running child
+keeps the environment inherited from its old launcher.
 
 After an interactive managed session exits successfully, `ai-memory run` offers
 the installed harnesses, a way to run the current harness again, and quit.

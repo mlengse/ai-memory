@@ -11,7 +11,9 @@
 //! marker, the head and tail the raw-observation list shows, or the first or
 //! last row that passes a predicate. [`SessionDigest::load`] reads exactly
 //! those with bounded queries, so the memory a SessionEnd spends does not grow
-//! with the session, and the output is the one the full row list produced.
+//! with the session, and the output is the one the full row list produced —
+//! the one exception being the `## Prompts` list, which is capped like the
+//! raw-observation list.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,6 +34,13 @@ use crate::payload::{is_safe_tool_title, tool_family_from_title};
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
 const RAW_OBSERVATION_TAIL_LINES: usize = RAW_OBSERVATION_MAX_LINES - RAW_OBSERVATION_HEAD_LINES;
+/// The `## Prompts` list is capped the way the raw-observation list is: a
+/// session with more prompts than this prints its first and last slice and
+/// an omission line between them. The values are the same bound, so the page
+/// never holds more prompt titles than raw-observation lines.
+pub(crate) const PROMPT_TITLES_MAX: usize = RAW_OBSERVATION_MAX_LINES;
+pub(crate) const PROMPT_TITLES_HEAD: usize = RAW_OBSERVATION_HEAD_LINES;
+pub(crate) const PROMPT_TITLES_TAIL: usize = PROMPT_TITLES_MAX - PROMPT_TITLES_HEAD;
 const SUBAGENT_PROMPT_PREAMBLE: &str = "You are a subagent spawned by another session.";
 
 /// Build a [`NewPage`] from the digest of a session's observations.
@@ -140,8 +149,9 @@ pub(crate) struct HandoffFacts {
 /// What a session's page and handoff are rendered from.
 ///
 /// Built by [`Self::load`] with bounded reads in one read transaction, so a
-/// session of any size costs the same memory apart from what the output itself
-/// lists: the title of every user prompt, because the page prints each one.
+/// session of any size costs the same memory apart from what the output
+/// itself lists: the first and last prompt-title slice the page prints, at
+/// most [`PROMPT_TITLES_MAX`] titles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDigest {
     /// Rows the session holds.
@@ -157,8 +167,14 @@ pub struct SessionDigest {
     start_at: Option<Timestamp>,
     /// The newest `SessionEnd`.
     end: Option<SessionEndFact>,
-    /// Every user prompt's title, in capture order.
+    /// The prompt titles the page lists: all of them when the session holds
+    /// at most [`PROMPT_TITLES_MAX`], otherwise the first
+    /// [`PROMPT_TITLES_HEAD`] and the last [`PROMPT_TITLES_TAIL`], each in
+    /// capture order.
     prompt_titles: Vec<String>,
+    /// User prompts the session holds (the true total; the list above is
+    /// bounded).
+    prompt_count: usize,
     /// Completed calls per tool name, keyed for stable ordering.
     tool_counts: BTreeMap<String, usize>,
     /// The page title.
@@ -173,7 +189,8 @@ pub(crate) struct DigestLoadStats {
     /// Rows deserialized: the raw-observation lines plus every row an
     /// early-exit scan visited (one resident at a time).
     pub rows_read: usize,
-    /// User prompts whose title the digest keeps.
+    /// User prompts the session holds (the digest keeps at most the bounded
+    /// slice of their titles).
     pub prompt_titles: usize,
     /// Prompt bodies read to settle the page title (one resident at a time).
     pub prompt_bodies_read: usize,
@@ -195,6 +212,33 @@ impl SessionDigest {
                 .await?
                 .0,
         )
+    }
+
+    /// [`Self::load`], also returning the session's observation count from
+    /// the SAME read snapshot the digest was built from.
+    ///
+    /// The idle auto-end tick binds that count to the end stamp (review R36
+    /// F3): an observation landing after the digest was built must invalidate
+    /// the stamp instead of reaching the watermark without reaching the page.
+    ///
+    /// # Errors
+    /// Propagates any store error.
+    pub(crate) async fn load_with_count(
+        reader: &ReaderPool,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<(Self, i64)> {
+        reader
+            .read_session_observations(workspace_id, project_id, session_id, move |snapshot| {
+                let (digest, _stats) = build_digest(snapshot, session_id)?;
+                // Overflow only with more than 9.2e18 observations: fail
+                // toward `Lost` at the stamp (an unrepresentable count never
+                // matches the stamp-time COUNT), never toward a wrong stamp.
+                let total = i64::try_from(snapshot.kind_summary()?.total).unwrap_or(i64::MAX);
+                Ok((digest, total))
+            })
+            .await
     }
 
     /// [`Self::load`], also reporting what the load read.
@@ -326,11 +370,18 @@ fn build_digest(
         None => None,
     };
 
+    // The prompt titles the page lists: bounded the way the raw-observation
+    // list is, with the true prompt count beside them.
+    let prompts = snapshot.prompt_titles(PROMPT_TITLES_HEAD, PROMPT_TITLES_TAIL)?;
+    let mut prompt_titles = prompts.first;
+    prompt_titles.extend(prompts.last);
+
     // Bodies only for a title that could be the subagent preamble: the title
-    // rule is the one reader of a prompt body.
+    // rule is the one reader of a prompt body, and the walk stops once the
+    // title is settled.
     let mut title_scan = PromptTitleScan::default();
     let mut prompt_bodies_read = 0;
-    let prompt_titles = snapshot.prompt_titles(SUBAGENT_PROMPT_PREAMBLE, |title, body| {
+    snapshot.scan_prompts(SUBAGENT_PROMPT_PREAMBLE, |title, body| {
         prompt_bodies_read += usize::from(body.is_some());
         title_scan.push(title, body.unwrap_or(""))
     })?;
@@ -394,7 +445,7 @@ fn build_digest(
 
     let stats = DigestLoadStats {
         rows_read: snapshot.rows_read(),
-        prompt_titles: prompt_titles.len(),
+        prompt_titles: prompts.total,
         prompt_bodies_read,
     };
     Ok((
@@ -406,6 +457,7 @@ fn build_digest(
             start_at,
             end,
             prompt_titles,
+            prompt_count: prompts.total,
             tool_counts,
             title,
             handoff,
@@ -561,11 +613,11 @@ const SUMMARY_MAX_NAMED_TOOLS: usize = 3;
 fn session_summary(digest: &SessionDigest) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    if !digest.prompt_titles.is_empty() {
+    if digest.prompt_count > 0 {
         parts.push(format!(
             "{} prompt{}",
-            digest.prompt_titles.len(),
-            plural(digest.prompt_titles.len())
+            digest.prompt_count,
+            plural(digest.prompt_count)
         ));
     }
 
@@ -693,10 +745,27 @@ fn render_body(session_id: SessionId, digest: &SessionDigest, title: &str) -> St
         buf.push_str(&format!("{note}\n\n"));
     }
 
-    if !digest.prompt_titles.is_empty() {
+    if digest.prompt_count > 0 {
         buf.push_str("## Prompts\n\n");
-        for (i, title) in digest.prompt_titles.iter().enumerate() {
-            buf.push_str(&format!("{}. {}\n", i + 1, title));
+        if digest.prompt_count <= PROMPT_TITLES_MAX {
+            for (i, title) in digest.prompt_titles.iter().enumerate() {
+                buf.push_str(&format!("{}. {title}\n", i + 1));
+            }
+        } else {
+            let (head, tail) = digest.prompt_titles.split_at(PROMPT_TITLES_HEAD);
+            for (i, title) in head.iter().enumerate() {
+                buf.push_str(&format!("{}. {title}\n", i + 1));
+            }
+            let omitted = digest.prompt_count - PROMPT_TITLES_HEAD - PROMPT_TITLES_TAIL;
+            buf.push_str(&format!(
+                "\n_... {omitted} prompts omitted from the middle (showing first {PROMPT_TITLES_HEAD} and last {PROMPT_TITLES_TAIL})._\n\n",
+            ));
+            for (i, title) in tail.iter().enumerate() {
+                buf.push_str(&format!(
+                    "{}. {title}\n",
+                    digest.prompt_count - PROMPT_TITLES_TAIL + i + 1
+                ));
+            }
         }
         buf.push('\n');
     }
@@ -847,6 +916,26 @@ impl SessionDigest {
                 *tool_counts.entry(obs.title.clone()).or_insert(0) += 1;
             }
         }
+        let prompt_titles_all: Vec<String> = observations
+            .iter()
+            .filter(|o| o.kind == ObservationKind::UserPrompt)
+            .map(|o| o.title.clone())
+            .collect();
+        // The store's bounded read keeps every title when the session fits in
+        // the cap and the first/last slice when it does not; mirror that here
+        // so the row-list digest and the database digest stay equal.
+        let (prompt_count, prompt_titles) = if prompt_titles_all.len() <= PROMPT_TITLES_MAX {
+            (prompt_titles_all.len(), prompt_titles_all)
+        } else {
+            (
+                prompt_titles_all.len(),
+                prompt_titles_all[..PROMPT_TITLES_HEAD]
+                    .iter()
+                    .chain(prompt_titles_all[prompt_titles_all.len() - PROMPT_TITLES_TAIL..].iter())
+                    .cloned()
+                    .collect(),
+            )
+        };
         Self {
             total,
             substantive: observations.iter().any(|o| {
@@ -864,11 +953,8 @@ impl SessionDigest {
                 created_at: o.created_at,
                 body: o.body.clone(),
             }),
-            prompt_titles: observations
-                .iter()
-                .filter(|o| o.kind == ObservationKind::UserPrompt)
-                .map(|o| o.title.clone())
-                .collect(),
+            prompt_titles,
+            prompt_count,
             tool_counts,
             title,
             handoff: HandoffFacts::from_observations(observations),
@@ -1662,5 +1748,116 @@ mod tests {
             page.body
                 .contains("100 raw observations omitted from the middle")
         );
+    }
+}
+
+#[cfg(test)]
+mod load_with_count_scopes {
+    use ai_memory_core::{
+        AgentKind, NewObservation, NewSession, ObservationKind, Sanitized, Sanitizer,
+    };
+    use ai_memory_store::Store;
+
+    use super::*;
+
+    /// The new raw-id entry point must refuse foreign tuples the way the
+    /// bounded read refuses them: the idle tick's digest can never load a
+    /// session's observations through a scope the session does not belong
+    /// to. Each refusal is paired with the legitimate control in the same
+    /// fixture.
+    #[tokio::test]
+    async fn foreign_and_missing_tuples_load_nothing_the_right_tuple_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "idle", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let foreign_ws = store
+            .writer
+            .get_or_create_workspace("foreign".to_string())
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+        async fn insert_obs(
+            store: &Store,
+            sid: SessionId,
+            ws: WorkspaceId,
+            proj: ProjectId,
+            kind: ObservationKind,
+            body: &str,
+        ) {
+            let obs = NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind,
+                extension: None,
+                source_event: None,
+                title: "scoped test event".into(),
+                body: body.into(),
+                importance: 5,
+                occurred_at: None,
+            };
+            store
+                .writer
+                .insert_observation(Sanitized::new(obs, &Sanitizer::builtin()))
+                .await
+                .unwrap();
+        }
+        insert_obs(&store, sid, ws, proj, ObservationKind::UserPrompt, "prompt").await;
+        insert_obs(&store, sid, ws, proj, ObservationKind::PostToolUse, "tool").await;
+        let reader = store.reader.clone();
+
+        // Violations: a foreign project, a foreign workspace, a missing id —
+        // each is refused, so none of them can load the session's rows.
+        let foreign_project = SessionDigest::load_with_count(&reader, ws, other, sid).await;
+        assert!(
+            matches!(foreign_project, Err(StoreError::SessionCollision)),
+            "a foreign project loads no observations"
+        );
+        let foreign_workspace =
+            SessionDigest::load_with_count(&reader, foreign_ws, proj, sid).await;
+        assert!(
+            matches!(foreign_workspace, Err(StoreError::SessionCollision)),
+            "a foreign workspace loads no observations"
+        );
+        let missing = SessionDigest::load_with_count(&reader, ws, proj, SessionId::new()).await;
+        assert!(
+            matches!(missing, Err(StoreError::SessionCollision)),
+            "a missing id loads nothing"
+        );
+
+        // Legitimate control: the right tuple loads the session's rows and
+        // counts them from the same snapshot.
+        let (digest, count) = SessionDigest::load_with_count(&reader, ws, proj, sid)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "the digest's snapshot counts both rows");
+        assert_eq!(digest.total, 2);
     }
 }

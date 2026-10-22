@@ -68,7 +68,8 @@ const PLAN_FORMAT: u32 = 1;
 /// cannot tell them apart: OpenCode 2 shares OpenCode's, and the Kiro CLI v3
 /// engine's store contains the v2 engine's. Wiring both would write two
 /// dialects into one config, so only the stable one is detected; the other is
-/// wired when named with `--agent`.
+/// wired when named with `--agent`. A detected OpenCode still gets the major
+/// its version probe reports ([`opencode_dialect`]).
 const EXPLICIT_ONLY: &[ManagedHarness] = &[ManagedHarness::OpenCode2, ManagedHarness::KiroV3];
 
 /// What `setup` will do.
@@ -181,17 +182,26 @@ fn skills_for(agent: AgentChoice) -> InstallSkillsAgent {
         AgentChoice::CopilotCli => InstallSkillsAgent::CopilotCli,
         AgentChoice::Devin => InstallSkillsAgent::Devin,
         AgentChoice::Hermes => InstallSkillsAgent::Hermes,
+        AgentChoice::AntigravityCli => InstallSkillsAgent::Antigravity,
         _ => InstallSkillsAgent::Agents,
     }
 }
 
-/// The OpenCode major version an agent names outright, so neither installer
-/// probes `opencode --version` and picks one dialect for both.
-fn opencode_dialect(agent: AgentChoice) -> Option<OpenCodeDialect> {
+/// The OpenCode major version to wire, resolved once so both installers use
+/// the same dialect. The `opencode2` alias names V2 outright; the generic
+/// `opencode` (named, or detected by the session store both majors share)
+/// probes `opencode --version` the way `install-mcp` and `install-hooks` do
+/// by hand, and a failed probe is an error rather than a guess.
+fn opencode_dialect(
+    agent: AgentChoice,
+    env: &super::run::EffectiveChildEnv,
+) -> Result<Option<OpenCodeDialect>> {
     match agent {
-        AgentChoice::OpenCode => Some(OpenCodeDialect::V1),
-        AgentChoice::OpenCode2 => Some(OpenCodeDialect::V2),
-        _ => None,
+        AgentChoice::OpenCode => {
+            super::opencode_dialect::resolve_generic(None, env).map(|found| Some(found.dialect))
+        }
+        AgentChoice::OpenCode2 => Ok(Some(OpenCodeDialect::V2)),
+        _ => Ok(None),
     }
 }
 
@@ -228,6 +238,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         }
         if let Some(dir) = ibm_bob_detected(&home) {
             found.push((AgentChoice::IbmBob, Found::ConfigDir(dir)));
+        }
+        if let Some(dir) = qwen_code_detected(&home) {
+            found.push((AgentChoice::QwenCode, Found::ConfigDir(dir)));
         }
         found
             .into_iter()
@@ -412,6 +425,13 @@ fn codebuddy_detected(home: &Path) -> Option<PathBuf> {
 /// IBM Bob's shared configuration directory, `~/.bob`, when it exists.
 fn ibm_bob_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".bob")).filter(|dir| dir.is_dir())
+}
+
+/// Qwen Code's directory, `~/.qwen`, when it exists. Qwen has no
+/// native-session adapter, so setup finds it by that directory rather than
+/// by [`detect_agents`].
+fn qwen_code_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".qwen")).filter(|dir| dir.is_dir())
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -956,7 +976,36 @@ fn wire_agent(
         );
         return problems;
     }
-    let dialect = opencode_dialect(plan.agent);
+    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    match opencode_dialect(plan.agent, &child_env) {
+        Ok(dialect) => wire_mcp_and_hooks(config, plan, dialect, &mut problems),
+        // A guessed major writes a plugin and MCP shape the installed OpenCode
+        // ignores without an error, so nothing is written instead.
+        Err(error) => problems.push(format!("skipped install-mcp and install-hooks: {error:#}")),
+    }
+    let skills_key = format!("{:?}", plan.skills);
+    if skills_done.insert(skills_key) {
+        let args = InstallSkillsArgs {
+            scope: InstallSkillsScope::Global,
+            agent: plan.skills,
+            target_dir: None,
+            print: false,
+            force: false,
+        };
+        if let Err(error) = install_skills::run(config, args) {
+            problems.push(format!("install-skills: {error:#}"));
+        }
+    }
+    problems
+}
+
+/// `install-mcp` then `install-hooks` for one agent, in one OpenCode dialect.
+fn wire_mcp_and_hooks(
+    config: &Config,
+    plan: &AgentPlan,
+    dialect: Option<OpenCodeDialect>,
+    problems: &mut Vec<String>,
+) {
     if let Some(client) = plan.mcp {
         if install_mcp::existing_entry_is_session_aware(client, None, ENTRY_NAME) {
             println!("mcp: keeping the existing session-aware entry");
@@ -1000,20 +1049,6 @@ fn wire_agent(
     {
         problems.push(format!("install-hooks: {error:#}"));
     }
-    let skills_key = format!("{:?}", plan.skills);
-    if skills_done.insert(skills_key) {
-        let args = InstallSkillsArgs {
-            scope: InstallSkillsScope::Global,
-            agent: plan.skills,
-            target_dir: None,
-            print: false,
-            force: false,
-        };
-        if let Err(error) = install_skills::run(config, args) {
-            problems.push(format!("install-skills: {error:#}"));
-        }
-    }
-    problems
 }
 
 /// `/healthz`, `memory_status` over MCP, and `doctor`; none of them writes a
@@ -1057,14 +1092,10 @@ async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
 async fn memory_status(config: &Config) -> Result<()> {
     use rmcp::ServiceExt as _;
     use rmcp::model::CallToolRequestParams;
-    use rmcp::transport::StreamableHttpClientTransport;
 
     let url = install_mcp::mcp_server_url_from_base(&config.server_url);
-    let transport = StreamableHttpClientTransport::from_config(super::mcp_bridge::upstream_config(
-        &url,
-        None,
-        config.auth.bearer_token.as_deref(),
-    )?);
+    let transport =
+        super::mcp_bridge::upstream_transport(&url, None, config.auth.bearer_token.as_deref())?;
     let client = ().serve(transport).await.with_context(|| format!("connecting to {url}"))?;
     let result = client
         .peer()
@@ -1132,6 +1163,25 @@ mod tests {
             InstallSkillsAgent::Agents
         );
         assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy, None).mcp, None);
+    }
+
+    #[test]
+    fn qwen_code_is_detected_and_wires_hooks_mcp_and_shared_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(qwen_code_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".qwen")).unwrap();
+        assert_eq!(
+            qwen_code_detected(home.path()),
+            Some(home.path().join(".qwen"))
+        );
+        assert_eq!(
+            skills_for(AgentChoice::QwenCode),
+            InstallSkillsAgent::Agents
+        );
+        assert_eq!(
+            AgentPlan::new(AgentChoice::QwenCode, None).mcp,
+            Some(McpClient::QwenCode)
+        );
     }
 
     #[test]
@@ -1547,10 +1597,51 @@ mod tests {
             InstallSkillsAgent::CopilotCli
         );
         assert_eq!(skills_for(AgentChoice::Codex), InstallSkillsAgent::Agents);
+        // Antigravity has no global `~/.agents/skills`; it reads its own roots.
+        assert_eq!(
+            skills_for(AgentChoice::AntigravityCli),
+            InstallSkillsAgent::Antigravity
+        );
         assert_eq!(
             skills_for(AgentChoice::KimiCode),
             InstallSkillsAgent::Agents
         );
+    }
+
+    /// Generic `opencode` takes the probed major; the `opencode2` alias and
+    /// other agents never run a probe, so an empty `PATH` cannot fail them.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_dialect_probes_only_the_generic_spelling() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let empty = super::super::run::EffectiveChildEnv::for_tests([("PATH", "")]);
+        assert_eq!(
+            opencode_dialect(AgentChoice::OpenCode2, &empty).unwrap(),
+            Some(OpenCodeDialect::V2)
+        );
+        assert_eq!(opencode_dialect(AgentChoice::Codex, &empty).unwrap(), None);
+        let error = format!(
+            "{:#}",
+            opencode_dialect(AgentChoice::OpenCode, &empty).unwrap_err()
+        );
+        assert!(error.contains("was not found"), "{error}");
+
+        for (version, expected) in [
+            ("2.0.31", OpenCodeDialect::V2),
+            ("1.18.34", OpenCodeDialect::V1),
+        ] {
+            let bin = tempfile::tempdir().unwrap();
+            let opencode = bin.path().join("opencode");
+            std::fs::write(&opencode, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+            std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let env = super::super::run::EffectiveChildEnv::for_tests([("PATH", bin.path())]);
+            assert_eq!(
+                opencode_dialect(AgentChoice::OpenCode, &env).unwrap(),
+                Some(expected),
+                "{version}"
+            );
+        }
     }
 
     #[test]

@@ -61,7 +61,7 @@ async fn render(
         async {
             state
                 .reader
-                .list_pages(&workspace, &project)
+                .list_unexpired_pages(&workspace, &project)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         },
@@ -133,6 +133,7 @@ async fn render(
         .collect();
 
     let mailbox_capped = mailbox_total > mailbox.len() as u64;
+    let graph_href = crate::templates::graph_href(&workspace, &project);
     let html = ProjectView {
         workspace,
         project,
@@ -143,6 +144,7 @@ async fn render(
         mailbox_total,
         mailbox_capped,
         sessions,
+        graph_href,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -277,9 +279,10 @@ async fn sessions(
 
 /// The project whose pages this page lists, or `None` when there is none.
 ///
-/// Matches the exact name, as `list_pages` does, so an alias that resolves to
-/// another project cannot put that project's mail beside these pages. A URL
-/// that names no project renders an empty mailbox, as it renders no pages.
+/// Matches the exact name, as `list_unexpired_pages` does, so an alias that
+/// resolves to another project cannot put that project's mail beside these
+/// pages. A URL that names no project renders an empty mailbox, as it renders
+/// no pages.
 async fn mailbox_scope(
     state: &WebState,
     workspace: &str,
