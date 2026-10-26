@@ -41,6 +41,14 @@ commands do: the `.ai-memory.toml` marker's `project`, then the git remote, then
 the directory name. `--confirm`, the preview and every other guard behave the
 same as with a name.
 
+That derived target is a deprecation, not a promise: `purge-project --confirm`
+without `--project`/`--project-id` prints the project it resolved and the
+command that names it, and it will be refused in 4.0, because the one thing a
+purge must not do is guess between "the checkout I am standing in" and "the
+project I meant" (#1642). An explicitly empty flag is already refused: `--project
+""` used to pass the "was it named" check and then resolve as if it had not been
+passed, which is how an unset variable in a script reached a real delete.
+
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
@@ -1009,6 +1017,11 @@ ai-memory restore-page --workspace default --project my-project \
   --path notes/foo.md --from <checkpoint>
 ```
 
+Each omitted scope flag is resolved from the current directory; a non-empty
+explicit value takes precedence over that default. An explicitly empty or
+whitespace-only flag is refused before any request, so an unset shell variable
+cannot restore a page in the checkout's project by accident.
+
 What happens:
 
 1. Server resolves `(workspace, project)` without auto-creating anything.
@@ -1209,10 +1222,13 @@ Order of operations:
 1. Check the data dir is empty (or the user passed `--force`).
 2. Extract the tarball into a staging directory beside the live data
    (`<data_dir>/.restore-staging-<stamp>/`), validating every entry.
-3. Open the staged store so pending migrations run and the SQLite
-   snapshot is verified, still without touching the live data. A legacy
-   database with API keys but no pepper verifier stops here unless the original
-   pepper is configured and `--accept-legacy-api-key-pepper` was passed. When
+3. Require an existing `db/memory.sqlite` snapshot with applied ai-memory
+   migration history, then open the staged store so pending migrations run
+   and the SQLite snapshot is checked, still without touching the live data.
+   A database with no pages is valid; an absent, zero-byte or uninitialized
+   database is refused rather than initialized into an empty replacement.
+   A legacy database with API keys but no pepper verifier stops here unless
+   the original pepper is configured and `--accept-legacy-api-key-pepper` was passed. When
    the live config is being kept (step 4) and the database holds API keys, the
    configured pepper must match the one the keys were hashed with, or the
    restore stops here too.
@@ -1244,6 +1260,9 @@ Failure modes:
   a snapshot the current binary cannot open** (for example a backup taken
   by a newer release) → exits with the error; the existing `wiki/` and
   `db/` are left as they were.
+- **Missing, empty or uninitialized database snapshot** → exits before the
+  swap. A restore requires the archive's `db/memory.sqlite` and its applied
+  migration history; it never initializes a new store to fill in missing data.
 - **Migration history has a gap** → an earlier migration is unrecorded
   although a later one was applied. The staged store is refused, just as at
   normal startup. Keep the backup and report the history for review;
