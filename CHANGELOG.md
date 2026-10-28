@@ -13,6 +13,87 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Refused empty and whitespace-only `--workspace` and `--project` flags at the
+  shared CLI scope-resolution choke point (`resolve_scope`,
+  `resolve_scope_noting_marker_project`, `resolve_scope_with_marker`, and
+  `resolve_workspace`) so an unset shell variable (`--project "$UNSET"`) or
+  blank value fails closed across all scoped CLI subcommands instead of
+  silently falling back to the current directory's scope or forwarding a
+  whitespace name (#1774).
+- OMP subagent sessions (the task tool, eval `agent()`, `/tan` clones) no
+  longer claim the pending handoff or leave one behind. OMP runs them inside
+  the parent's process and loads the extension into each, so a subagent's
+  first prompt claimed the newest open handoff in the checkout and its end left
+  a sub-task handoff for the next session. The extension now reads OMP's
+  `ctx.agent`, skips the claim for a subagent and posts its events with
+  `agent_id`, which the router treats like an OpenCode child session.
+  `drop_subagent_captures` now covers OMP subagents too, and an advisor's tool
+  calls stay with the session they advise (#1779).
+
+## [3.2.9] - 2026-10-27
+
+### Fixed
+
+- Fixed Antigravity CLI hooks on Windows failing when the install or profile
+  path contains spaces — bare hook commands are now caret-escaped (#1767).
+- `ai-memory read-page` now refuses explicitly empty scope flags (`--workspace`
+  and `--project`), empty `--path`, and an empty search query before resolving
+  scope or sending a request to the server (#1769).
+
+- `ai-memory finalize-session` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) before resolving scope or querying the server
+  (#1771).
+
+- Admission webhook URLs are validated when the chain is built: only
+  `http://` and `https://` URLs are accepted. A webhook configured with any
+  other scheme (`file:`, `ftp:`, a custom scheme), a bare hostname, or an
+  empty URL could never be called, yet previously loaded fine and then
+  errored on every covered write at request time — under a `reject` failure
+  policy that aborted each write. The server now refuses to start and names
+  the offending webhook instead (#1766).
+
+## [3.2.8] - 2026-10-27
+
+### Fixed
+
+- `ai-memory restore-page` now refuses empty or whitespace-only `--path` and
+  `--from` values before resolving scope, authentication, or sending a request
+  to the server (#1764).
+- `ai-memory message` subcommands (`send`, `pop`, and `cancel`) now refuse
+  explicitly empty scope flags and targets before reading stdin or sending
+  any request to the server (#1761).
+- `ai-memory rename-project` now refuses an explicitly empty `--to` target
+  name before sending any request to the server (#1759).
+- `ai-memory write-page` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) as well as an empty `--path` before
+  reading stdin or sending any request. Passing an empty `--project ""`
+  previously bypassed the flag check while falling back to resolving the
+  project from the current working directory (#1757).
+
+## [3.2.7] - 2026-10-26
+
+### Fixed
+
+- Fixed `ai-memory doctor` native memory inspection omitting Antigravity CLI
+  and using a Claude-only synthetic probe (#1745).
+- Fixed native hook backlogs repeatedly missing their 250 ms mid-session
+  delivery window on loaded macOS hosts. Threshold catch-up now launches the
+  long-budget detached drainer, and POSIX fallback hooks use macOS's real
+  Application Support data directory for spool and auth state (#1744).
+
+## [3.2.6] - 2026-10-26
+
+### Fixed
+
+- Fixed `ai-memory-wikisync` scope-adoption warnings containing long runs of
+  spaces where source formatting had leaked into the displayed sentence.
+- Fixed opt-in cold-page compaction replacing a newer user edit with the stale
+  episodic body and metadata it had selected earlier. The sweep now writes the
+  whole compaction batch only when every selected page version is still latest;
+  one changed page leaves the entire batch untouched for the next sweep (#1721).
+- Automatic backfill no longer flashes a console window for each Git probe on
+  Windows. Git children inherit `CREATE_NO_WINDOW`, and a run resolves each
+  harness's session directory only once (#1727).
 - The OpenCode version probe now waits up to 10 seconds instead of 2, allowing
   cold-start executable scanning and loaded hosts without treating a working
   installation as hung (#1718).
@@ -2830,7 +2911,11 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.5...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.9...HEAD
+[3.2.9]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.9
+[3.2.8]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.8
+[3.2.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.7
+[3.2.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.6
 [3.2.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.5
 [3.2.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.4
 [3.2.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.3
