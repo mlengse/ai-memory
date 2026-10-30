@@ -4760,9 +4760,6 @@ impl ReaderPool {
     /// `viewer` restricts the pages to repositories that user may read — see
     /// [`readable_repository_filter`]. `None` lists every repository.
     ///
-    /// `viewer` restricts the pages to repositories that user may read — see
-    /// [`readable_repository_filter`]. `None` lists every repository.
-    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn recent_pages_global(
