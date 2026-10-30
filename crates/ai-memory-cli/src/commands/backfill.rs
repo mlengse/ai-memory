@@ -1932,6 +1932,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
             skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
@@ -2134,6 +2135,7 @@ mod tests {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            record_tool_names: false,
             skip_wiki_checkpoints: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);

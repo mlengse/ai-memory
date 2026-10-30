@@ -195,6 +195,7 @@ pub async fn run() -> Result<()> {
         Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::MoveProject(args) => commands::move_project::run(&config, args).await,
+        Command::MergeProject(args) => commands::merge_project::run(&config, args).await,
         Command::MoveSession(args) => commands::move_session::run(&config, args).await,
         Command::Uninstall(args) => commands::uninstall::run(&config, args),
         Command::Upgrade(args) => commands::upgrade::run(&config, args).await,
