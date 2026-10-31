@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `memory_recent` no longer overloads the `rank` field with the page's
+  `updated_at` timestamp (µs), which made `rank` mean a relevance score in
+  `memory_query` and a raw timestamp in `memory_recent`. Recency listings now
+  report `rank` as the 0-based recency position and carry the timestamp in a new
+  `updated_at_us` field (`None`, and omitted from JSON, for search hits), so
+  `rank` means the same thing — a sort key, lower is better — across both tools
+  (F-006).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
