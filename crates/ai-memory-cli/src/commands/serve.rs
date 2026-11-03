@@ -64,6 +64,9 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// after client-side prune; keep hooks/MCP at [`MAX_BODY_BYTES`].
 const BOOTSTRAP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Startup and failure retry delay, capped by each job's configured interval.
+/// This is a catch-up delay cap for overdue maintenance jobs at startup,
+/// NOT the maintenance scan interval. The scan intervals are
+/// forget_sweep_interval_secs and lint_interval_secs (both default 86_400s = 24h).
 const MAINTENANCE_STARTUP_DELAY_CAP: Duration = Duration::from_secs(60);
 /// How often the durable SessionEnd consolidation worker checks for work when
 /// no hook notification arrives (including jobs recovered after restart).
