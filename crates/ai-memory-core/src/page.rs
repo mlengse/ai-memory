@@ -11,6 +11,8 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use uuid::Uuid;
+
 use crate::ids::{PageId, PagePath, ProjectId, WorkspaceId};
 
 /// Lifetime classification for a page.
@@ -174,6 +176,20 @@ pub const MAX_PAGE_APPLIES_TO: usize = 16;
 pub const MAX_PAGE_APPLIES_TO_TAG_LEN: usize = 32;
 /// Maximum raw characters in `enforced_by`, before trimming.
 pub const MAX_PAGE_ENFORCED_BY_LEN: usize = 256;
+/// Maximum `source_files` entries in one write.
+pub const MAX_PAGE_SOURCES: usize = 16;
+/// Maximum raw characters in one `source_files` path, before trimming.
+pub const MAX_PAGE_SOURCE_PATH_LEN: usize = 1024;
+
+/// A repository file a page describes, and the commit the page was last
+/// checked against (`git rev-parse HEAD` when it was written).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PageSource {
+    /// Repository-relative path with `/` separators, at most 1024 raw characters.
+    pub path: String,
+    /// Commit id, 7-64 hex characters (SHA-1 or SHA-256 repositories); lowercased.
+    pub commit: String,
+}
 
 /// Editable metadata shared by public page-write surfaces.
 ///
@@ -214,6 +230,14 @@ pub struct PageWriteMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 256))]
     pub enforced_by: Option<String>,
+    /// Repository files this page describes, each with the commit it was
+    /// checked against. Up to 16. Stored as-is; the server never reads the
+    /// files: a client compares each entry with its checkout and records
+    /// `stale` feedback when one changed. Not OKF `sources`, which holds the
+    /// page's session provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub source_files: Vec<PageSource>,
 }
 
 impl PageWriteMetadata {
@@ -347,6 +371,27 @@ impl PageWriteMetadata {
         }
         if !applies_to.is_empty() {
             fm.insert("applies_to".into(), serde_json::json!(applies_to));
+        }
+        if self.source_files.len() > MAX_PAGE_SOURCES {
+            return Err(invalid("source_files"));
+        }
+        let mut sources = Vec::with_capacity(self.source_files.len());
+        for source in self.source_files {
+            let path = source.path.trim();
+            let commit = source.commit.trim().to_ascii_lowercase();
+            if !valid_text(&source.path, MAX_PAGE_SOURCE_PATH_LEN)
+                || path.chars().any(char::is_control)
+                || path.contains('\\')
+                || path.split('/').any(|seg| matches!(seg, "" | "." | ".."))
+                || !(7..=64).contains(&commit.len())
+                || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(invalid("source_files"));
+            }
+            sources.push(serde_json::json!({ "path": path, "commit": commit }));
+        }
+        if !sources.is_empty() {
+            fm.insert("source_files".into(), serde_json::Value::Array(sources));
         }
         Ok(fm)
     }
@@ -638,6 +683,123 @@ impl Tier {
     }
 }
 
+/// Which kind of memory a [`MemoryPage`] holds (specs/032-cas-memory-patch).
+///
+/// Section patching targets only these two tiers — never `working` or
+/// `episodic`, which are transient by design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageType {
+    /// How-to procedures and repeated patterns.
+    Procedural,
+    /// Distilled facts, decisions and architecture notes.
+    Semantic,
+}
+
+impl PageType {
+    /// Canonical short string for storage and serialisation. Matches the
+    /// `memory_pages.page_type` CHECK constraint (V100).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Procedural => "procedural",
+            Self::Semantic => "semantic",
+        }
+    }
+}
+
+impl FromStr for PageType {
+    type Err = crate::MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "procedural" => Ok(Self::Procedural),
+            "semantic" => Ok(Self::Semantic),
+            other => Err(crate::MemoryError::MalformedRecord(format!(
+                "unknown page type: {other} (want procedural|semantic)"
+            ))),
+        }
+    }
+}
+
+/// SHA-256 of `content`, lowercase hex encoded (64 characters).
+///
+/// This is the single definition every section row, read result and CAS
+/// precondition agrees on, so a hash taken at read time compares byte-for-byte
+/// with the one a later patch verifies (FR-001, SC-004).
+#[must_use]
+pub fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(content.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        // Writing into a `String` never fails.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// One `## Heading` section of a [`MemoryPage`].
+///
+/// Identity is the combination of [`Self::heading`] text and [`Self::order`]
+/// within the page (clarified Q2), so two sections sharing a heading stay
+/// distinguishable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Section {
+    /// Heading text without the leading `## `.
+    pub heading: String,
+    /// 1-based position within the page.
+    pub order: u32,
+    /// Section body (Markdown, excluding the heading line).
+    pub content: String,
+    /// SHA-256 of [`Self::content`], see [`content_hash`].
+    pub content_hash: String,
+}
+
+impl Section {
+    /// Build a section, computing its [`Self::content_hash`].
+    #[must_use]
+    pub fn new(heading: impl Into<String>, order: u32, content: impl Into<String>) -> Self {
+        let content = content.into();
+        let content_hash = content_hash(&content);
+        Self {
+            heading: heading.into(),
+            order,
+            content,
+            content_hash,
+        }
+    }
+}
+
+/// A `procedural`/`semantic` memory page split into ordered sections
+/// (specs/032-cas-memory-patch).
+///
+/// Distinct from [`Page`], which is a versioned wiki document: a memory page is
+/// patched section-by-section and carries its own revision identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPage {
+    /// Stable page identity.
+    pub page_id: Uuid,
+    /// Current page revision; bumps on every successful patch.
+    pub revision_id: Uuid,
+    /// Which kind of memory this page holds.
+    pub page_type: PageType,
+    /// Sections ordered by [`Section::order`].
+    pub sections: Vec<Section>,
+}
+
+impl MemoryPage {
+    /// Find the section identified by `heading` + `order`, if present.
+    #[must_use]
+    pub fn section(&self, heading: &str, order: u32) -> Option<&Section> {
+        self.sections
+            .iter()
+            .find(|section| section.heading == heading && section.order == order)
+    }
+}
+
 /// An explicit judgement on how useful a recalled page was.
 ///
 /// The M8 decay formula's only reinforcement signal is the access
@@ -832,6 +994,50 @@ mod tests {
                 serde_json::from_value::<PageWriteMetadata>(bad.clone()).is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn page_write_metadata_source_files_are_validated_and_normalized() {
+        let parse = |sources: serde_json::Value| -> PageWriteMetadata {
+            serde_json::from_value(serde_json::json!({ "source_files": sources })).unwrap()
+        };
+        let ok = serde_json::json!({"path": "src/a.rs", "commit": "3f2a9c1"});
+        let fm = parse(serde_json::json!([
+            {"path": " bin/deploy.sh ", "commit": "3F2A9C1"},
+            {"path": "src/a.rs", "commit": "a".repeat(64)},
+        ]))
+        .into_frontmatter()
+        .unwrap();
+        assert_eq!(
+            fm["source_files"][0],
+            serde_json::json!({"path": "bin/deploy.sh", "commit": "3f2a9c1"})
+        );
+        assert_eq!(fm["source_files"][1]["commit"], "a".repeat(64));
+        assert!(fm.get("sources").is_none(), "OKF `sources` stays untouched");
+        assert!(
+            parse(serde_json::json!(vec![ok.clone(); MAX_PAGE_SOURCES]))
+                .into_frontmatter()
+                .is_ok()
+        );
+        for bad in [
+            serde_json::json!([{"path": "/etc/passwd", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "../x", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a/./b", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a//b", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a\\b", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "a\nb", "commit": "3f2a9c1"}]),
+            serde_json::json!([{"path": "", "commit": "3f2a9c1"}]),
+            serde_json::json!([{
+                "path": "a".repeat(MAX_PAGE_SOURCE_PATH_LEN + 1),
+                "commit": "3f2a9c1"
+            }]),
+            serde_json::json!([{"path": "x", "commit": "3f2a9c"}]),
+            serde_json::json!([{"path": "x", "commit": "3f2a9cz"}]),
+            serde_json::json!([{"path": "x", "commit": "a".repeat(65)}]),
+            serde_json::json!(vec![ok.clone(); MAX_PAGE_SOURCES + 1]),
+        ] {
+            assert!(parse(bad.clone()).into_frontmatter().is_err(), "{bad}");
         }
     }
 

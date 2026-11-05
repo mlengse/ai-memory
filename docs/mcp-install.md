@@ -23,7 +23,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > other client gets a local stdio entry, in its own format, that runs
 > `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
 > the token file at launch and forwards no session id, so the client passes
-> `workspace` and `project` like any static client. Stdio entries name the
+> `workspace` and `project` like any static client. When a call names no
+> scope, the bridge fills in the project of the directory the client launched
+> it from, resolved the way the CLI resolves one (see
+> [`auto-scope.md`](auto-scope.md#the-session-less-bridges-launch-scope)). Stdio entries name the
 > `ai-memory` binary by its absolute path, so the client does not need it on
 > its `PATH`; the Docker wrapper keeps the bare `ai-memory`. When the install
 > was given a data dir (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in
@@ -54,6 +57,14 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > Other connection failures, such as a host name that does not resolve, are
 > reported at once.
 
+> **Inbox push is explicit.** A session-aware Claude Code bridge can add
+> `--channel inbox` to advertise Claude's experimental `claude/channel`
+> capability and push a count-only pending-mail notice when it changes.
+> Claude loads it only when started with
+> `claude --dangerously-load-development-channels server:<entry name>`, since
+> the ai-memory bridge is not on Claude's channel allowlist. See
+> [`agent-messaging.md`](agent-messaging.md#mid-session-notices-for-claude-code).
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
 > required), so any client that points a remote URL at `/mcp`, including
@@ -63,7 +74,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > supports stdio servers; session state has nothing to do with it. If you run a
 > client that *requires* MCP session continuity or server-initiated SSE
 > streams, start the server with `ai-memory serve --transport http
-> --http-stateful` to restore rmcp's session mode.
+> --http-stateful` to restore the legacy initialize-era session mode. Clients
+> that speak MCP 2026-07-28 use `server/discover` and per-request version
+> metadata, both served without a session; clients that send the older
+> `initialize` handshake keep working.
 
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start. For OpenCode, the generic

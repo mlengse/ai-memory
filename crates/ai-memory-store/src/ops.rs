@@ -204,30 +204,46 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
-/// Reindex a disk page without reviving a purged session's summary.
+/// Reindex or restore a page without reviving a purged session's summary.
 /// The tombstone and any surviving manual version are checked in the upsert
 /// transaction, so a directory walk's earlier snapshot cannot authorize a
-/// write after a session purge. Explicit page writes/restores use `upsert_page`.
+/// write after a session purge. Explicit new page writes use `upsert_page`.
 pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let session = page
-        .path
+    check_page_restore_allowed(
+        &tx,
+        page.workspace_id,
+        page.project_id,
+        &page.path,
+        &page.frontmatter_json,
+    )?;
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Check the original page metadata against session-purge tombstones.
+pub(crate) fn check_page_restore_allowed(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> StoreResult<()> {
+    let session = path
         .as_str()
         .strip_prefix("sessions/")
         .and_then(|rest| rest.strip_suffix(".md"))
         .and_then(|id| id.parse::<SessionId>().ok());
     if let Some(session) = session {
         let session_text = session.to_string();
-        let owns_file = page
-            .frontmatter_json
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            == Some(session_text.as_str());
+        let owns_file =
+            frontmatter.get("session_id").and_then(|v| v.as_str()) == Some(session_text.as_str());
         // #866 keeps manual versions at this path. They may keep changing,
         // but absence of `session_id` alone is not permission to recreate a
         // deleted page: legacy summaries can lack that field too (#701).
-        let blocked: bool = tx.query_row(
+        let blocked: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM purged_sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3) \
                AND (?6 OR NOT EXISTS(SELECT 1 FROM pages \
@@ -235,10 +251,10 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
                    AND is_latest = 1 \
                    AND json_extract(frontmatter_json, '$.session_id') IS NOT ?5))",
             params![
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
                 session.as_bytes(),
-                page.path.as_str(),
+                path.as_str(),
                 session_text,
                 owns_file
             ],
@@ -248,9 +264,7 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
             return Err(StoreError::SessionPurged(session_text));
         }
     }
-    let id = upsert_page_in_tx(&tx, page, now)?;
-    tx.commit()?;
-    Ok(id)
+    Ok(())
 }
 
 /// What a conditional page write requires of the current latest version.
@@ -4055,11 +4069,11 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
         }
         _ => (None, None),
     };
-    conn.execute(
+    let result = conn.execute(
         "INSERT INTO observations \
          (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
-          importance, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+          importance, created_at, file_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id.as_bytes(),
             obs.session_id.as_bytes(),
@@ -4072,8 +4086,42 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
             obs.body,
             importance,
             now,
+            obs.file_path,
         ],
-    )?;
+    );
+    // Historical migration tests stop before V99 and exercise this helper
+    // against that frozen schema, as with `finish_cjk_index_write`. A real
+    // Store migrates first, so a missing column stays a fatal error in every
+    // production build.
+    #[cfg(test)]
+    let result = match result {
+        Err(error)
+            if obs.file_path.is_none()
+                && error.to_string().contains("no column named file_path") =>
+        {
+            conn.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                  title, body, importance, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    id.as_bytes(),
+                    obs.session_id.as_bytes(),
+                    obs.workspace_id.as_bytes(),
+                    obs.project_id.as_bytes(),
+                    kind,
+                    extension,
+                    source_event,
+                    obs.title,
+                    obs.body,
+                    importance,
+                    now,
+                ],
+            )
+        }
+        other => other,
+    };
+    result?;
     index_observation_cjk(conn, conn.last_insert_rowid(), &obs.title, &obs.body)?;
     Ok(id)
 }
@@ -4470,6 +4518,124 @@ pub fn record_page_feedback(
     )?;
     tx.commit()?;
     Ok(Some((page_id, next_salience)))
+}
+
+/// Record one implicit (normalized query → page) association (#1941, slice 2)
+/// and return the association's signal count after the upsert.
+///
+/// The upsert keys on `(workspace, project, query hash, page version)` and
+/// increments `signal_count` only when the writing session differs from
+/// `last_session`, so one session repeating the same read contributes at most
+/// one association. Like the access-bump reinforcement this is an implicit
+/// signal, so it writes no audit row. A `page_id` that is no longer the
+/// current version in this scope — rewritten, purged or deleted between the
+/// read and this detached write — is a no-op returning `0`, never an error:
+/// the association attaches to the version exactly as explicit feedback does.
+pub fn record_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+    session: Option<&str>,
+) -> StoreResult<u32> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(0);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    // Session keys are client-supplied strings. Store the same `SessionId`
+    // the hook ingress derives for that native id: it is bounded (a UUID),
+    // and it is what lets `purge_session` find this row and delete the query
+    // text the purged session wrote.
+    let session: Option<String> =
+        session.map(|s| ai_memory_core::SessionId::from_native(s).to_string());
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    // The EXISTS guard is the FK lesson from `bump_access_for_pages_for_actor`:
+    // this write is detached from the read that triggered it, so the page may
+    // be gone. It must also still be the CURRENT version — an association
+    // pointing at a superseded version never boosts anything, and recording
+    // one would only orphan text.
+    let is_current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pages \
+          WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND is_latest = 1)",
+        params![
+            page_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    if !is_current {
+        tx.rollback()?;
+        return Ok(0);
+    }
+    tx.execute(
+        "INSERT INTO query_page_signals \
+           (workspace_id, project_id, query_hash, page_id, query_text, signal_count, last_session, last_seen) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7) \
+         ON CONFLICT(workspace_id, project_id, query_hash, page_id) DO UPDATE SET \
+           signal_count = CASE WHEN query_page_signals.last_session IS ?6 \
+                               THEN query_page_signals.signal_count \
+                               ELSE query_page_signals.signal_count + 1 END, \
+           query_text = excluded.query_text, \
+           last_session = excluded.last_session, \
+           last_seen = excluded.last_seen",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes(),
+            normalized,
+            session,
+            now,
+        ],
+    )?;
+    let count: i64 = tx.query_row(
+        "SELECT signal_count FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Drop one implicit (normalized query → page) association (#1941): the
+/// negative signal a `not_helpful` feedback right after the query sends.
+/// Returns whether a row was removed. Removing the row (rather than storing a
+/// negative count) keeps the boost one-sided: an association can lose its
+/// boost, but a page can never be pushed below where plain ranking put it by
+/// this signal.
+pub fn forget_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+) -> StoreResult<bool> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    let removed = conn.execute(
+        "DELETE FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+    )?;
+    Ok(removed > 0)
 }
 
 /// Mark the expected latest page as evicted by the forget sweep.
@@ -6413,6 +6579,192 @@ pub fn rename_project(
     Ok(())
 }
 
+/// What [`adopt_project_identity`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedProjectIdentity {
+    /// The project that now carries the repository identity, under its
+    /// final name.
+    pub project: String,
+    /// That project's name before the move.
+    pub previous: String,
+    /// The emptied project's name afterwards.
+    pub archived: String,
+    /// The repository identity that moved.
+    pub identity: String,
+}
+
+/// Move the repository identity of the empty project `from` onto `into`, the
+/// project that holds the checkout's sessions (#1993).
+///
+/// A checkout captured before it had a git remote keeps its sessions in a
+/// project named after the folder, while the remote, once added, gets its own
+/// project. Renaming alone leaves the identity on the remote project, so
+/// identity-based resolution keeps routing new work there. This moves the
+/// identity and its derived name keys, gives `into` the remote-derived name,
+/// and renames `from` to `archive_name` (default `<name>-split-<YYYYMMDD>`)
+/// when it held that name. Nothing is deleted. It is idempotent once applied.
+///
+/// # Errors
+/// - [`StoreError::NotFound`] when either project is missing from the
+///   workspace.
+/// - [`StoreError::InvalidState`] when the two are the same project, `from`
+///   carries no identity, `into` already carries a different one, `from`
+///   holds sessions or pages, or a managed run is live in `from`.
+/// - [`StoreError::ProjectNameTaken`] / [`StoreError::InvalidProjectName`]
+///   from the renames.
+pub fn adopt_project_identity(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    into: &ProjectId,
+    from: &ProjectId,
+    archive_name: Option<&str>,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<AdoptedProjectIdentity> {
+    if into == from {
+        return Err(StoreError::InvalidState(
+            "a project cannot adopt its own identity".into(),
+        ));
+    }
+    let tx = conn.transaction()?;
+    let load = |id: &ProjectId| -> StoreResult<[String; 5]> {
+        tx.query_row(
+            "SELECT name, identity, identity_source, canonical_name, legacy_name \
+             FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![id.as_bytes(), workspace_id.as_bytes()],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ])
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!(
+                "project id {id} is not in workspace {workspace_id}"
+            ))
+        })
+    };
+    let [into_name, into_identity, ..] = load(into)?;
+    let [from_name, identity, source, canonical, legacy] = load(from)?;
+    let count = |sql: &str| -> StoreResult<i64> {
+        Ok(tx.query_row(sql, [from.as_bytes()], |row| row.get(0))?)
+    };
+    if count("SELECT COUNT(*) FROM sessions WHERE project_id = ?1")? > 0
+        || count("SELECT COUNT(*) FROM pages WHERE project_id = ?1")? > 0
+    {
+        return Err(StoreError::InvalidState(format!(
+            "project '{from_name}' holds its own sessions or pages; compare the two projects \
+             before merging them"
+        )));
+    }
+    if identity.is_empty() {
+        if into_identity.is_empty() {
+            return Err(StoreError::InvalidState(format!(
+                "project '{from_name}' has no repository identity to move"
+            )));
+        }
+        // Already applied: the empty project gave its identity away earlier.
+        return Ok(AdoptedProjectIdentity {
+            previous: into_name.clone(),
+            project: into_name,
+            archived: from_name,
+            identity: into_identity,
+        });
+    }
+    if !into_identity.is_empty() && into_identity != identity {
+        return Err(StoreError::InvalidState(format!(
+            "project '{into_name}' already belongs to repository {into_identity}"
+        )));
+    }
+    if count(
+        "SELECT COUNT(*) FROM managed_runs r JOIN workstreams w ON w.id = r.workstream_id \
+         WHERE w.project_id = ?1 AND r.state = 'active'",
+    )? > 0
+    {
+        return Err(StoreError::InvalidState(format!(
+            "a managed run is still active in project '{from_name}'; let it finish first"
+        )));
+    }
+    let target = if canonical.is_empty() {
+        from_name.clone()
+    } else {
+        canonical.clone()
+    };
+    // The identity index is unique per workspace: clear it on `from` before
+    // `into` takes it.
+    tx.execute(
+        "UPDATE projects SET identity = '', identity_source = '', canonical_name = '', \
+         legacy_name = '' WHERE id = ?1",
+        [from.as_bytes()],
+    )?;
+    let archived = if from_name == target {
+        let archive = archive_name.map_or_else(
+            || {
+                format!(
+                    "{from_name}-split-{}",
+                    jiff::Zoned::now().strftime("%Y%m%d")
+                )
+            },
+            |name| name.trim().to_owned(),
+        );
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            from,
+            Some(&from_name),
+            &archive,
+            author_id,
+            "adopt_project_identity",
+        )?;
+        archive
+    } else {
+        from_name
+    };
+    if into_name != target {
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            into,
+            Some(&into_name),
+            &target,
+            author_id,
+            "adopt_project_identity",
+        )?;
+    }
+    tx.execute(
+        "UPDATE projects SET identity = ?1, identity_source = ?2, canonical_name = ?3, \
+         legacy_name = ?4 WHERE id = ?5",
+        params![identity, source, canonical, legacy, into.as_bytes()],
+    )?;
+    let detail = serde_json::json!({
+        "identity": identity,
+        "into": target,
+        "from": archived,
+    })
+    .to_string();
+    audit_with_detail(
+        &tx,
+        "adopt_project_identity",
+        Some(workspace_id.as_bytes()),
+        Some(into.as_bytes()),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
+        &detail,
+    )?;
+    tx.commit()?;
+    Ok(AdoptedProjectIdentity {
+        project: target,
+        previous: into_name,
+        archived,
+        identity,
+    })
+}
+
 /// Record a successfully-applied wiki-structure migration.
 ///
 /// Uses `INSERT OR IGNORE` so re-running the same name is a no-op
@@ -7272,6 +7624,19 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![format!("session:{session_id}")],
     )?;
 
+    // Query-signal associations (#1941) this session wrote last carry its
+    // query text. The row goes with the session, even when earlier sessions
+    // also confirmed it: the text is the user's, and the boost is a
+    // convenience that the next confirming session rebuilds. Not scoped to
+    // this project: a row is filed under the QUERIED project, so a session
+    // that searched a sibling scope left its text there. No index covers
+    // `last_session`; this rare path scans the opt-in table rather than make
+    // every signal upsert maintain one.
+    tx.execute(
+        "DELETE FROM query_page_signals WHERE last_session = ?1",
+        rusqlite::params![session_id.to_string()],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -7664,6 +8029,11 @@ pub fn purge_project(
         });
     }
 
+    // Query signals this project's sessions filed under OTHER projects carry
+    // their query text; the cascade below only reaches this project's rows.
+    // Must run before the cascade removes the sessions it matches against.
+    delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
+
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
     // other projects may still live there.
@@ -7718,6 +8088,30 @@ pub fn purge_project(
         workstream_ids,
         compacted,
     })
+}
+
+/// Delete the query-signal rows (#1941) whose `last_session` is one of the
+/// sessions `sessions_where` selects, in any project.
+///
+/// A signal row is filed under the project that was queried, not the one the
+/// session belongs to, so a purge's own cascade misses the rows its sessions
+/// left in sibling scopes — and each still holds the session's query text.
+/// `last_session` is the session id's hyphenated text form (see
+/// [`record_query_page_signal`]), rebuilt here from the blob key so the delete
+/// is one statement rather than a per-session loop.
+fn delete_query_signals_of_sessions(
+    tx: &rusqlite::Transaction<'_>,
+    sessions_where: &str,
+    id: &[u8],
+) -> StoreResult<u64> {
+    let sql = format!(
+        "DELETE FROM query_page_signals WHERE last_session IN ( \
+           SELECT lower(substr(hex(id), 1, 8) || '-' || substr(hex(id), 9, 4) || '-' \
+                     || substr(hex(id), 13, 4) || '-' || substr(hex(id), 17, 4) || '-' \
+                     || substr(hex(id), 21, 12)) \
+             FROM sessions WHERE {sessions_where})"
+    );
+    Ok(tx.execute(&sql, rusqlite::params![id])? as u64)
 }
 
 /// Summary returned by [`delete_workspace`].
@@ -7891,6 +8285,9 @@ pub fn delete_workspace(
         });
     }
 
+    // Same cross-scope query-signal cleanup as `purge_project`, before the
+    // cascade removes the sessions it matches against.
+    delete_query_signals_of_sessions(&tx, "workspace_id = ?1", &wid[..])?;
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
         rusqlite::params![&wid[..]],
@@ -8135,6 +8532,7 @@ pub fn move_project_workspace(
         "profile_candidates",
         "profile_entry_ledger",
         "profile_harvest_marks",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!(
@@ -8398,6 +8796,7 @@ pub fn merge_project(
         "session_consolidation_jobs",
         "page_feedback",
         "purged_sessions",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
@@ -9089,6 +9488,731 @@ pub fn delete_stale_page_embeddings(
     Ok(u64::try_from(n.saturating_add(orphans)).unwrap_or(0))
 }
 
+// ---------------------------------------------------------------------------
+// CAS precondition & section patching (specs/032-cas-memory-patch)
+// ---------------------------------------------------------------------------
+
+/// Optional CAS preconditions supplied with a patch (FR-002).
+///
+/// Every provided precondition must match the current state; when both are
+/// omitted the operation runs without CAS verification.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CasPreconditions {
+    /// Expected current section content hash (SHA-256 hex).
+    pub expected_content_hash: Option<String>,
+    /// Expected current page revision id.
+    pub expected_revision_id: Option<uuid::Uuid>,
+}
+
+impl CasPreconditions {
+    /// No precondition supplied — no CAS verification runs.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether at least one precondition is present.
+    #[must_use]
+    pub fn is_some(&self) -> bool {
+        self.expected_content_hash.is_some() || self.expected_revision_id.is_some()
+    }
+}
+
+/// Which patch operation a caller requested (FR-006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPatchOperation {
+    /// Replace an existing section's content.
+    Replace,
+    /// Append a brand-new section to the page.
+    Add,
+    /// Append `new_content` to an existing section's content.
+    Append,
+}
+
+impl MemoryPatchOperation {
+    /// Stable snake_case token used on the tool boundary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Add => "add",
+            Self::Append => "append",
+        }
+    }
+}
+
+impl std::str::FromStr for MemoryPatchOperation {
+    type Err = StoreError;
+
+    fn from_str(token: &str) -> Result<Self, Self::Err> {
+        match token {
+            "replace" => Ok(Self::Replace),
+            "add" => Ok(Self::Add),
+            "append" => Ok(Self::Append),
+            other => Err(StoreError::InvalidOperation(format!(
+                "unknown operation: {other} (want replace|add|append)"
+            ))),
+        }
+    }
+}
+
+/// A successful patch outcome (contract `sulur_patch` output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPatchOutcome {
+    /// Target page identity.
+    pub page_id: uuid::Uuid,
+    /// New page revision after the patch.
+    pub revision_id: uuid::Uuid,
+    /// Patched section heading.
+    pub section_heading: String,
+    /// Patched section order.
+    pub section_order: u32,
+    /// SHA-256 of the new section content.
+    pub content_hash: String,
+    /// Operation performed.
+    pub operation: MemoryPatchOperation,
+    /// Whether old content was snapshotted to `revision` (true for replace).
+    pub revision_snapshot_recorded: bool,
+}
+
+/// Create a brand-new memory page with the given sections.
+///
+/// # Errors
+/// Propagates SQL errors, and refuses a duplicate heading or order.
+pub fn create_memory_page(
+    conn: &mut rusqlite::Connection,
+    page_type: ai_memory_core::PageType,
+    sections: &[ai_memory_core::Section],
+) -> StoreResult<ai_memory_core::MemoryPage> {
+    let now = Timestamp::now().as_microsecond();
+    let page_id = uuid::Uuid::now_v7();
+    let revision_id = uuid::Uuid::now_v7();
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO memory_pages (id, revision_id, page_type, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        rusqlite::params![
+            page_id.as_bytes(),
+            revision_id.as_bytes(),
+            page_type.as_str(),
+            now,
+        ],
+    )?;
+    let mut stored = Vec::with_capacity(sections.len());
+    for section in sections {
+        let hash = insert_memory_section_in_tx(
+            &tx,
+            page_id,
+            section.order,
+            &section.heading,
+            &section.content,
+            now,
+        )?;
+        stored.push(ai_memory_core::Section {
+            heading: section.heading.clone(),
+            order: section.order,
+            content: section.content.clone(),
+            content_hash: hash,
+        });
+    }
+    tx.commit()?;
+    Ok(ai_memory_core::MemoryPage {
+        page_id,
+        revision_id,
+        page_type,
+        sections: stored,
+    })
+}
+
+/// Load a memory page (header + ordered sections) from a connection.
+///
+/// `conn` may be a `rusqlite::Transaction`, which derefs to `Connection`.
+///
+/// # Errors
+/// [`StoreError::NotFound`] when no such page exists; propagates SQL errors.
+pub(crate) fn load_memory_page(
+    conn: &rusqlite::Connection,
+    page_id: uuid::Uuid,
+) -> StoreResult<ai_memory_core::MemoryPage> {
+    let header: Option<(Vec<u8>, String)> = conn
+        .query_row(
+            "SELECT revision_id, page_type FROM memory_pages WHERE id = ?1",
+            rusqlite::params![page_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((revision_bytes, page_type_str)) = header else {
+        return Err(StoreError::NotFound(format!("memory page {page_id}")));
+    };
+    let revision_id = uuid::Uuid::from_slice(&revision_bytes)
+        .map_err(|error| StoreError::MalformedRecord(error.to_string()))?;
+    let page_type: ai_memory_core::PageType = page_type_str.parse()?;
+    let mut stmt = conn.prepare(
+        "SELECT heading, section_order, content, content_hash \
+           FROM memory_sections WHERE page_id = ?1 ORDER BY section_order",
+    )?;
+    let sections = stmt
+        .query_map(rusqlite::params![page_id.as_bytes()], |row| {
+            Ok(ai_memory_core::Section {
+                heading: row.get(0)?,
+                order: u32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                content: row.get(2)?,
+                content_hash: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<ai_memory_core::Section>, _>>()?;
+    Ok(ai_memory_core::MemoryPage {
+        page_id,
+        revision_id,
+        page_type,
+        sections,
+    })
+}
+
+/// Insert one section row, computing and returning its content hash.
+fn insert_memory_section_in_tx(
+    conn: &rusqlite::Connection,
+    page_id: uuid::Uuid,
+    order: u32,
+    heading: &str,
+    content: &str,
+    now: i64,
+) -> StoreResult<String> {
+    let hash = ai_memory_core::content_hash(content);
+    conn.execute(
+        "INSERT INTO memory_sections \
+         (id, page_id, heading, section_order, content, content_hash, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![
+            uuid::Uuid::now_v7().as_bytes(),
+            page_id.as_bytes(),
+            heading,
+            i64::from(order),
+            content,
+            hash,
+            now,
+        ],
+    )?;
+    Ok(hash)
+}
+
+/// Evaluate the content-hash CAS precondition against the target section
+/// (FR-002).
+fn check_content_hash_precondition(
+    section: &ai_memory_core::Section,
+    preconditions: &CasPreconditions,
+) -> StoreResult<()> {
+    if let Some(expected) = &preconditions.expected_content_hash
+        && &section.content_hash != expected
+    {
+        return Err(StoreError::PreconditionFailed(format!(
+            "content_hash expected {expected}, current {}",
+            section.content_hash
+        )));
+    }
+    Ok(())
+}
+
+/// Evaluate the page-revision CAS precondition (FR-002).
+fn check_revision_precondition(
+    page: &ai_memory_core::MemoryPage,
+    preconditions: &CasPreconditions,
+) -> StoreResult<()> {
+    if let Some(expected) = preconditions.expected_revision_id
+        && page.revision_id != expected
+    {
+        return Err(StoreError::PreconditionFailed(format!(
+            "revision_id expected {expected}, current {}",
+            page.revision_id
+        )));
+    }
+    Ok(())
+}
+
+/// Patch one section of a memory page under optional CAS preconditions.
+///
+/// Every gate refuses before touching a row:
+/// 1. role (`editor` only, FR-008),
+/// 2. page revision precondition,
+/// 3. per-operation target resolution + content-hash precondition,
+/// 4. for `replace`: a `revision` snapshot of the old content (FR-004),
+/// 5. the write and the revision bump, in one transaction.
+///
+/// # Errors
+/// [`StoreError::Unauthorized`], [`StoreError::PreconditionFailed`],
+/// [`StoreError::SectionNotFound`], [`StoreError::InvalidOperation`], or any
+/// SQL error.
+// The signature mirrors the `sulur_patch` tool contract (page, operation,
+// section identity, new content, preconditions, role); bundling these into a
+// struct would only move the same fields behind one more name.
+#[allow(clippy::too_many_arguments)]
+pub fn patch_memory_section(
+    conn: &mut rusqlite::Connection,
+    page_id: uuid::Uuid,
+    operation: MemoryPatchOperation,
+    heading: &str,
+    order: u32,
+    new_content: &str,
+    preconditions: &CasPreconditions,
+    role: crate::grants::MemoryRole,
+) -> StoreResult<MemoryPatchOutcome> {
+    crate::project_authz::authorize_memory_patch(role)?;
+
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let current = load_memory_page(&tx, page_id)?;
+
+    check_revision_precondition(&current, preconditions)?;
+
+    // Resolve the target and the content the section will hold afterwards.
+    // `snapshot_old` carries the pre-replace content when one must be recorded.
+    let (result_order, final_content, snapshot_old) = match operation {
+        MemoryPatchOperation::Replace => {
+            let Some(section) = current.section(heading, order) else {
+                return Err(StoreError::SectionNotFound(format!(
+                    "replace '{heading}' (order {order}): no such section"
+                )));
+            };
+            check_content_hash_precondition(section, preconditions)?;
+            (order, new_content.to_owned(), Some(section.content.clone()))
+        }
+        MemoryPatchOperation::Append => {
+            let Some(section) = current.section(heading, order) else {
+                return Err(StoreError::SectionNotFound(format!(
+                    "append '{heading}' (order {order}): no such section"
+                )));
+            };
+            check_content_hash_precondition(section, preconditions)?;
+            let mut joined = section.content.clone();
+            joined.push_str(new_content);
+            (order, joined, None)
+        }
+        MemoryPatchOperation::Add => {
+            if current.sections.iter().any(|s| s.heading == heading) {
+                return Err(StoreError::InvalidOperation(format!(
+                    "add '{heading}': a section with that heading already exists"
+                )));
+            }
+            let next_order = current
+                .sections
+                .iter()
+                .map(|s| s.order)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            (next_order, new_content.to_owned(), None)
+        }
+    };
+
+    let new_revision_id = uuid::Uuid::now_v7();
+
+    // FR-004: snapshot the old content before the replace takes effect, keyed
+    // by the revision this patch produces.
+    let revision_snapshot_recorded = if let Some(old_content) = &snapshot_old {
+        crate::writer::record_revision_snapshot_in_tx(
+            &tx,
+            new_revision_id,
+            page_id,
+            heading,
+            result_order,
+            old_content,
+            now,
+        )?;
+        true
+    } else {
+        false
+    };
+
+    let new_hash = ai_memory_core::content_hash(&final_content);
+    match operation {
+        MemoryPatchOperation::Replace | MemoryPatchOperation::Append => {
+            let updated = tx.execute(
+                "UPDATE memory_sections \
+                    SET content = ?1, content_hash = ?2, updated_at = ?3 \
+                  WHERE page_id = ?4 AND section_order = ?5",
+                rusqlite::params![
+                    final_content,
+                    new_hash,
+                    now,
+                    page_id.as_bytes(),
+                    i64::from(result_order),
+                ],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::SectionNotFound(format!(
+                    "'{heading}' (order {result_order}): section vanished mid-patch"
+                )));
+            }
+        }
+        MemoryPatchOperation::Add => {
+            insert_memory_section_in_tx(&tx, page_id, result_order, heading, &final_content, now)?;
+        }
+    }
+
+    tx.execute(
+        "UPDATE memory_pages SET revision_id = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![new_revision_id.as_bytes(), now, page_id.as_bytes()],
+    )?;
+
+    tx.commit()?;
+
+    Ok(MemoryPatchOutcome {
+        page_id,
+        revision_id: new_revision_id,
+        section_heading: heading.to_owned(),
+        section_order: result_order,
+        content_hash: new_hash,
+        operation,
+        revision_snapshot_recorded,
+    })
+}
+
+#[cfg(test)]
+mod memory_patch_tests {
+    //! Tests for specs/032-cas-memory-patch: CAS preconditions, section
+    //! patching, revision snapshots, and role-based access.
+
+    use super::*;
+    use ai_memory_core::{PageType, Section};
+
+    fn fresh_conn() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory_patch.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "MEMORY").unwrap();
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        (tmp, conn)
+    }
+
+    fn seeded(conn: &mut Connection) -> ai_memory_core::MemoryPage {
+        let sections = vec![
+            Section::new("Rules", 1, "Original rules"),
+            Section::new("Decisions", 2, "Original decisions"),
+        ];
+        create_memory_page(conn, PageType::Semantic, &sections).unwrap()
+    }
+
+    fn editor() -> crate::grants::MemoryRole {
+        crate::grants::MemoryRole::Editor
+    }
+
+    #[test]
+    fn section_replace_leaves_other_sections_unchanged() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let rules_hash = page.section("Rules", 1).unwrap().content_hash.clone();
+        let decisions_hash = page.section("Decisions", 2).unwrap().content_hash.clone();
+
+        let out = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Rules",
+            1,
+            "Updated rules",
+            &CasPreconditions {
+                expected_content_hash: Some(rules_hash.clone()),
+                expected_revision_id: Some(page.revision_id),
+            },
+            editor(),
+        )
+        .unwrap();
+
+        assert_eq!(out.operation, MemoryPatchOperation::Replace);
+        assert_eq!(out.section_order, 1);
+        assert!(out.revision_snapshot_recorded);
+        assert_ne!(out.revision_id, page.revision_id, "revision must bump");
+
+        let reloaded = crate::read_memory_page(&conn, page.page_id).unwrap();
+        assert_eq!(reloaded.revision_id, out.revision_id);
+        assert_eq!(
+            reloaded.section("Rules", 1).unwrap().content,
+            "Updated rules"
+        );
+        assert_eq!(
+            reloaded.section("Decisions", 2).unwrap().content_hash,
+            decisions_hash,
+            "untouched section hash must not change"
+        );
+        assert_eq!(
+            reloaded.section("Rules", 1).unwrap().content_hash,
+            out.content_hash
+        );
+        assert_ne!(
+            reloaded.section("Rules", 1).unwrap().content_hash,
+            rules_hash
+        );
+    }
+
+    #[test]
+    fn content_hash_mismatch_is_precondition_failed_and_writes_nothing() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let err = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Rules",
+            1,
+            "Nope",
+            &CasPreconditions {
+                expected_content_hash: Some("deadbeef".into()),
+                expected_revision_id: None,
+            },
+            editor(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::PreconditionFailed(_)), "{err:?}");
+        let reloaded = crate::read_memory_page(&conn, page.page_id).unwrap();
+        assert_eq!(reloaded.revision_id, page.revision_id, "no write, no bump");
+        assert_eq!(
+            reloaded.section("Rules", 1).unwrap().content,
+            "Original rules"
+        );
+    }
+
+    #[test]
+    fn revision_id_mismatch_is_precondition_failed() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let err = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Rules",
+            1,
+            "Nope",
+            &CasPreconditions {
+                expected_content_hash: None,
+                expected_revision_id: Some(uuid::Uuid::now_v7()),
+            },
+            editor(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::PreconditionFailed(_)), "{err:?}");
+        let reloaded = crate::read_memory_page(&conn, page.page_id).unwrap();
+        assert_eq!(
+            reloaded.section("Rules", 1).unwrap().content,
+            "Original rules"
+        );
+    }
+
+    #[test]
+    fn exactly_one_of_two_conflicting_patches_wins() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let observed = crate::read_memory_page(&conn, page.page_id).unwrap();
+        let hash = observed.section("Rules", 1).unwrap().content_hash.clone();
+        let preconditions = CasPreconditions {
+            expected_content_hash: Some(hash),
+            expected_revision_id: Some(observed.revision_id),
+        };
+
+        // Session A patches first and wins.
+        let first = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Rules",
+            1,
+            "Session A",
+            &preconditions,
+            editor(),
+        );
+        assert!(first.is_ok(), "{first:?}");
+
+        // Session B replays with the same (now stale) preconditions.
+        let second = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Rules",
+            1,
+            "Session B",
+            &preconditions,
+            editor(),
+        );
+        assert!(
+            matches!(second, Err(StoreError::PreconditionFailed(_))),
+            "{second:?}"
+        );
+
+        let reloaded = crate::read_memory_page(&conn, page.page_id).unwrap();
+        assert_eq!(
+            reloaded.section("Rules", 1).unwrap().content,
+            "Session A",
+            "the losing patch must not have overwritten the winner"
+        );
+    }
+
+    #[test]
+    fn add_section_registers_a_new_heading_with_hash() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let out = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Add,
+            "New Rule",
+            1,
+            "Fresh rule",
+            &CasPreconditions::none(),
+            editor(),
+        )
+        .unwrap();
+        assert_eq!(out.operation, MemoryPatchOperation::Add);
+        assert_eq!(
+            out.section_order, 3,
+            "appended after the two existing sections"
+        );
+        assert!(!out.revision_snapshot_recorded);
+
+        let reloaded = crate::read_memory_page(&conn, page.page_id).unwrap();
+        assert_eq!(reloaded.sections.len(), 3);
+        let added = reloaded
+            .section("New Rule", 3)
+            .expect("new section present");
+        assert_eq!(added.content, "Fresh rule");
+        assert_eq!(
+            added.content_hash,
+            ai_memory_core::content_hash("Fresh rule")
+        );
+    }
+
+    #[test]
+    fn replace_records_revision_snapshot_of_old_content() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let out = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Rules",
+            1,
+            "New rules",
+            &CasPreconditions::none(),
+            editor(),
+        )
+        .unwrap();
+        assert!(out.revision_snapshot_recorded);
+
+        let (revision_id, page_id, heading, order, old_content): (
+            Vec<u8>,
+            Vec<u8>,
+            String,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT revision_id, page_id, heading, section_order, old_content FROM revision",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(revision_id.as_slice(), out.revision_id.as_bytes());
+        assert_eq!(page_id.as_slice(), page.page_id.as_bytes());
+        assert_eq!(heading, "Rules");
+        assert_eq!(order, 1);
+        assert_eq!(old_content, "Original rules");
+    }
+
+    #[test]
+    fn viewer_role_is_unauthorized_and_writes_nothing() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let err = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Rules",
+            1,
+            "Viewer write",
+            &CasPreconditions::none(),
+            crate::grants::MemoryRole::Viewer,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::Unauthorized(_)), "{err:?}");
+        let reloaded = crate::read_memory_page(&conn, page.page_id).unwrap();
+        assert_eq!(
+            reloaded.section("Rules", 1).unwrap().content,
+            "Original rules"
+        );
+        assert_eq!(reloaded.revision_id, page.revision_id);
+    }
+
+    #[test]
+    fn replace_missing_section_is_section_not_found() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let err = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Replace,
+            "Nope",
+            9,
+            "x",
+            &CasPreconditions::none(),
+            editor(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::SectionNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn add_duplicate_heading_is_invalid_operation() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let err = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Add,
+            "Rules",
+            1,
+            "dup",
+            &CasPreconditions::none(),
+            editor(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidOperation(_)), "{err:?}");
+    }
+
+    #[test]
+    fn append_extends_existing_section() {
+        let (_tmp, mut conn) = fresh_conn();
+        let page = seeded(&mut conn);
+        let out = patch_memory_section(
+            &mut conn,
+            page.page_id,
+            MemoryPatchOperation::Append,
+            "Rules",
+            1,
+            " plus more",
+            &CasPreconditions::none(),
+            editor(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.content_hash,
+            ai_memory_core::content_hash("Original rules plus more")
+        );
+        let reloaded = crate::read_memory_page(&conn, page.page_id).unwrap();
+        assert_eq!(
+            reloaded.section("Rules", 1).unwrap().content,
+            "Original rules plus more"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     //! Focused unit tests for the load-bearing mutating SQL paths.
@@ -9640,6 +10764,7 @@ pub(crate) mod tests {
             title: "hook".into(),
             body: "observation".into(),
             importance: 5,
+            file_path: None,
         }
     }
 
@@ -9931,6 +11056,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray).unwrap();
 
@@ -10038,6 +11164,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -10374,6 +11501,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &collateral_obs).unwrap();
 
@@ -11896,6 +13024,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -14043,6 +15172,7 @@ pub(crate) mod tests {
                 title: "Read".into(),
                 body: "README.md".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14104,6 +15234,7 @@ pub(crate) mod tests {
                 title: "stop".into(),
                 body: String::new(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14151,6 +15282,7 @@ pub(crate) mod tests {
                 title: "hello".into(),
                 body: "do the thing".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14212,6 +15344,7 @@ pub(crate) mod tests {
                     title: "t".into(),
                     body: "b".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -14669,6 +15802,7 @@ pub(crate) mod tests {
                 title: "hook".into(),
                 body: "observation".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14714,6 +15848,7 @@ pub(crate) mod tests {
                 title: "hook".into(),
                 body: "observation".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -15496,6 +16631,7 @@ pub(crate) mod tests {
                 title: "t".into(),
                 body: "b".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -16030,6 +17166,7 @@ pub(crate) mod tests {
                     title: format!("movable-obs-{n}"),
                     body: "zebra token body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -16582,6 +17719,7 @@ pub(crate) mod tests {
                     title: format!("stray-obs-{i}"),
                     body: "zebra token body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -17197,6 +18335,7 @@ pub(crate) mod tests {
                     title: format!("call {i}"),
                     body: "body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -17559,6 +18698,7 @@ pub(crate) mod tests {
                     title: format!("call {i}"),
                     body: "body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -17651,6 +18791,7 @@ pub(crate) mod tests {
                     title: "before v20".into(),
                     body: "existing observation survives table rebuild".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -18181,6 +19322,7 @@ pub(crate) mod tests {
             title: "t".into(),
             body: "b".into(),
             importance: 5,
+            file_path: None,
         };
         assert!(
             insert_observation(&mut conn, &mismatched_obs).is_err(),
@@ -18234,6 +19376,155 @@ pub(crate) mod tests {
     /// `404 Not Found`. Pins both the writer-side semantic and a
     /// concrete recipe for the failure shape so a future refactor
     /// can't quietly downgrade the error back to a silent Ok.
+    /// A folder-named project holding the sessions (`api`) and the empty
+    /// remote-named project that owns the repository identity (`acme-api`):
+    /// the state #1993 left behind.
+    fn split_projects(conn: &mut Connection, ws: &WorkspaceId) -> (ProjectId, ProjectId) {
+        let folder = get_or_create_project(conn, ws, "api", None).unwrap();
+        begin_session(conn, &hook_session(SessionId::new(), *ws, folder, None)).unwrap();
+        let (remote, _) = resolve_project_by_identity(
+            conn,
+            ws,
+            &acme_api_identity(),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
+            false,
+            "acme-api",
+            None,
+            None,
+            None,
+            crate::AccessMode::Open,
+        )
+        .unwrap();
+        assert_ne!(folder, remote, "the fixture must reproduce the split");
+        (folder, remote)
+    }
+
+    fn acme_api_identity() -> ai_memory_core::repository_identity::RepositoryIdentity {
+        ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        }
+    }
+
+    fn name_and_identity(conn: &Connection, id: &ProjectId) -> (String, String) {
+        conn.query_row(
+            "SELECT name, identity FROM projects WHERE id = ?1",
+            [id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Identity-based resolution reaches the session-holding project after the
+    /// move, for a fresh split and for one already renamed by hand (the
+    /// half-repaired state 3.4.1's two renames left), and a second call
+    /// changes nothing.
+    #[test]
+    fn adopt_project_identity_routes_the_remote_to_the_session_project() {
+        for renamed_by_hand in [false, true] {
+            let (_tmp, mut conn, ws, _) = fresh_db();
+            let (folder, remote) = split_projects(&mut conn, &ws);
+            if renamed_by_hand {
+                rename_project(&mut conn, &ws, &remote, "acme-api-split-20261105", None).unwrap();
+                rename_project(&mut conn, &ws, &folder, "acme-api", None).unwrap();
+            }
+            let adopted = adopt_project_identity(
+                &mut conn,
+                &ws,
+                &folder,
+                &remote,
+                Some("acme-api-split-20261105"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                adopted,
+                AdoptedProjectIdentity {
+                    project: "acme-api".into(),
+                    previous: String::from(if renamed_by_hand { "acme-api" } else { "api" }),
+                    archived: "acme-api-split-20261105".into(),
+                    identity: "github.com/acme/api".into(),
+                },
+                "renamed_by_hand={renamed_by_hand}"
+            );
+            assert_eq!(
+                name_and_identity(&conn, &folder),
+                ("acme-api".into(), "github.com/acme/api".into())
+            );
+            assert_eq!(
+                name_and_identity(&conn, &remote),
+                ("acme-api-split-20261105".into(), String::new())
+            );
+            let (resolved, _) = resolve_project_by_identity(
+                &mut conn,
+                &ws,
+                &acme_api_identity(),
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                false,
+                "acme-api",
+                None,
+                None,
+                None,
+                crate::AccessMode::Open,
+            )
+            .unwrap();
+            assert_eq!(resolved, folder, "renamed_by_hand={renamed_by_hand}");
+            let again =
+                adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap();
+            assert_eq!(
+                again,
+                AdoptedProjectIdentity {
+                    previous: "acme-api".into(),
+                    ..adopted
+                },
+                "applying it twice changes nothing"
+            );
+        }
+    }
+
+    /// Each refusal leaves both projects exactly as they were.
+    #[test]
+    fn adopt_project_identity_refuses_anything_that_could_hide_data() {
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        let before = (
+            name_and_identity(&conn, &folder),
+            name_and_identity(&conn, &remote),
+        );
+        let refused = |conn: &mut Connection, into: &ProjectId, from: &ProjectId| {
+            let error = adopt_project_identity(conn, &ws, into, from, None, None).unwrap_err();
+            assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
+        };
+        // The session project cannot give away the identity it lacks, and a
+        // project cannot adopt itself.
+        refused(&mut conn, &remote, &folder);
+        refused(&mut conn, &folder, &folder);
+        // The remote project holds a session of its own.
+        let session = SessionId::new();
+        begin_session(&mut conn, &hook_session(session, ws, remote, None)).unwrap();
+        refused(&mut conn, &folder, &remote);
+        assert_eq!(
+            (
+                name_and_identity(&conn, &folder),
+                name_and_identity(&conn, &remote)
+            ),
+            before
+        );
+        // The session project already belongs to another repository.
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        conn.execute(
+            "UPDATE projects SET identity = 'github.com/acme/other', identity_source = 'git_remote' \
+             WHERE id = ?1",
+            [folder.as_bytes()],
+        )
+        .unwrap();
+        let error =
+            adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap_err();
+        assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
+        assert_eq!(name_and_identity(&conn, &remote).1, "github.com/acme/api");
+    }
+
     #[test]
     fn rename_project_after_purge_returns_not_found() {
         let (_tmp, mut conn, ws, proj) = fresh_db();

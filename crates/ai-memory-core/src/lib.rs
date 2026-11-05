@@ -14,7 +14,8 @@ pub mod excerpt;
 pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
-pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
+pub use ingest_metrics::{FilePathOutcome, IngestMetrics, IngestMetricsSnapshot};
+pub mod i18n;
 pub mod ids;
 pub mod latency;
 pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, LatencyTimer};
@@ -83,14 +84,15 @@ pub use message::{
     NewAgentMessage, UNTRUSTED_MESSAGE_NOTICE,
 };
 pub use observation::{
-    FAILED_TOOL_OUTCOME_LINE, NewObservation, NewSession, NewSessionUsage, Observation,
-    ObservationKind, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX,
-    TokenCall, TokenCallContext, TokenToolRef, TokenToolRelation,
+    FAILED_TOOL_OUTCOME_LINE, FILE_PATH_MAX_CHARS, NewObservation, NewSession, NewSessionUsage,
+    Observation, ObservationKind, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR,
+    TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef, TokenToolRelation,
+    valid_file_path_key,
 };
 pub use page::{
-    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
-    PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
-    normalize_entity, parse_expires_at_instant,
+    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, MemoryPage, NewPage, Page,
+    PageEvidence, PageEvidenceKind, PageType, Relation, Section, Tier, content_hash,
+    frontmatter_entity_names, normalize_entities, normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{
     COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,
