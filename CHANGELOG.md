@@ -41,6 +41,14 @@ version in [`docs/changelog/`](docs/changelog/):
   ai-jail releases, and Copilot and Command Code, keep the previous launch
   (#2020).
 
+- `memory_recent` no longer overloads the `rank` field with the page's
+  `updated_at` timestamp (µs), which made `rank` mean a relevance score in
+  `memory_query` and a raw timestamp in `memory_recent`. Recency listings now
+  report `rank` as the 0-based recency position and carry the timestamp in a new
+  `updated_at_us` field (`None`, and omitted from JSON, for search hits), so
+  `rank` means the same thing — a sort key, lower is better — across both tools
+  (F-006).
+
 - A project name no longer turns ambiguous because an empty leftover project
   holds it literally. When a remote-derived name such as `acme-api` matches
   both the project that owns that repository and an empty project created

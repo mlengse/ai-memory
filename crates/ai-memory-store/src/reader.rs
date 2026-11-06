@@ -1858,7 +1858,9 @@ pub struct PageHitWithMeta {
     /// serialized as safe HTML with `<mark>` around genuine matches.
     #[serde(serialize_with = "serialize_highlighted_snippet")]
     pub snippet: String,
-    /// Relevance rank after the bounded authority adjustment (lower is better).
+    /// Sort key, lower is better. Global search hits carry the FTS5 relevance
+    /// rank after the bounded authority adjustment; the global `recent*`
+    /// listing carries the 0-based recency position.
     pub rank: f64,
     /// Unix microseconds the page version was last updated. Populated only by
     /// the global `recent*` listing; `None` (and omitted from JSON) for search
@@ -4886,8 +4888,8 @@ impl ReaderPool {
                     path: PagePath::new(path)?,
                     title,
                     snippet,
-                    rank: idx as f64,
-                    updated_at_us: Some(rank as i64),
+                    rank,
+                    updated_at_us: None,
                     superseded: false,
                     pinned: true,
                 });
@@ -4961,10 +4963,9 @@ impl ReaderPool {
     /// cross-project analog of [`Self::recent_pages_for_project`]; used when a
     /// read's scope broadens to global.
     ///
-    /// Recency has no FTS relevance score, so the reused
-    /// [`PageHitWithMeta::rank`] field carries `updated_at` (µs, cast to
-    /// REAL) — larger still means "ranks first", callers must not read it
-    /// as an FTS rank.
+    /// Recency has no FTS relevance score, so [`PageHitWithMeta::rank`]
+    /// carries the 0-based recency position (newest first) and the timestamp
+    /// travels in [`PageHitWithMeta::updated_at_us`].
     ///
     /// `viewer` restricts the pages to repositories that user may read — see
     /// [`readable_repository_filter`]. `None` lists every repository.
@@ -5016,7 +5017,8 @@ impl ReaderPool {
             })?;
             let mut hits = Vec::new();
             for (idx, row) in rows.enumerate() {
-                let (id_bytes, workspace_name, project_name, path, title, snippet, updated_at_us) = row?;
+                let (id_bytes, workspace_name, project_name, path, title, snippet, updated_at_us) =
+                    row?;
                 hits.push(PageHitWithMeta {
                     id: PageId::from_slice(&id_bytes)?,
                     workspace_name,

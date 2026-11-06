@@ -5519,6 +5519,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
     tracing::debug!("writer thread exiting cleanly");
 }
 
+/// Record the old content of a section into the `revision` audit table
+/// (FR-004, specs/032-cas-memory-patch).
+///
+/// Called by [`crate::ops::patch_memory_section`] inside the patch transaction,
+/// before the replacement takes effect, so a successful replace always leaves
+/// at least one snapshot linked to the revision and section identity it
+/// superseded.
 #[cfg(test)]
 mod tests {
     use super::*;

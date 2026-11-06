@@ -9512,6 +9512,23 @@ pub fn delete_stale_page_embeddings(
     Ok(u64::try_from(n.saturating_add(orphans)).unwrap_or(0))
 }
 
+/// Create or update a memory page with optional CAS preconditions.
+///
+/// # Errors
+
+/// Patch one section of a memory page under optional CAS preconditions.
+///
+/// Every gate refuses before touching a row:
+/// 1. role (`editor` only, FR-008),
+/// 2. page revision precondition,
+/// 3. per-operation target resolution + content-hash precondition,
+/// 4. for `replace`: a `revision` snapshot of the old content (FR-004),
+/// 5. the write and the revision bump, in one transaction.
+///
+/// # Errors
+/// [`StoreError::Unauthorized`], [`StoreError::PreconditionFailed`],
+/// [`StoreError::SectionNotFound`], [`StoreError::InvalidOperation`], or any
+/// SQL error.
 #[cfg(test)]
 pub(crate) mod tests {
     //! Focused unit tests for the load-bearing mutating SQL paths.

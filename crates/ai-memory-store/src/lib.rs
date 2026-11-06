@@ -19,12 +19,12 @@ mod auto_improve;
 pub mod belief;
 mod dashboard;
 pub mod decay;
-mod error;
+pub mod error;
 mod fts_query;
-mod grants;
+pub mod grants;
 mod maintenance;
 mod migrations;
-mod ops;
+pub mod ops;
 pub mod password;
 mod profile;
 mod provenance;
@@ -66,17 +66,19 @@ pub use error::{
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
-    ConditionalBatchUpsert, ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary,
-    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IdentityResolution,
-    IdleEndAction, IdleEndCandidate, IdleEndResult, IngestObservationOutcome,
-    LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary,
+    AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord,
+    CompactSummary, Compaction, ConditionalBatchUpsert, ConditionalUpsert, DateOnlyTtlPage,
+    DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
+    HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MergeProjectPage, MergeProjectSummary,
     MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
     PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
     ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
     RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
     SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
-    backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    backfill_page_windows_in_batches,
+    purge_session, record_embed_failure,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_DIGEST_READ_CAP, PROFILE_HARVEST_BATCH,
@@ -85,8 +87,9 @@ pub use profile::{
     ProjectProfileFlags,
 };
 pub use project_authz::{
-    AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
-    RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
+    AccessMode, GrantLevel, ProjectAccess, ProjectAuthz,
+    ProjectPrincipal, RESTRICTED_PROJECT_FORBIDDEN, authorize_project,
+    resolve_project_authz,
 };
 pub use query_signals::{
     QUERY_SIGNAL_COUNT_CAP, QUERY_SIGNAL_TEXT_MAX_CHARS, QuerySignalRow, normalize_query,
@@ -3328,6 +3331,65 @@ mod tests {
             .find(|h| h.path.as_str() == "blank.md")
             .expect("page should be listed");
         assert_eq!(hit.snippet, "Body prose that wins.");
+    }
+
+    #[tokio::test]
+    async fn recent_hits_carry_a_positional_rank_and_the_updated_at_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "one.md", "Body one"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "two.md", "Body two"))
+            .await
+            .unwrap();
+
+        let hits = store
+            .reader
+            .recent_pages_for_project(ws, proj, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        for (idx, hit) in hits.iter().enumerate() {
+            // `rank` is the 0-based recency position, never the µs timestamp
+            // (which previously leaked into the rank field).
+            assert_eq!(
+                hit.rank, idx as f64,
+                "recent rank must be positional: {hit:?}"
+            );
+            assert!(
+                hit.updated_at_us
+                    .is_some_and(|us| us > 1_000_000_000_000_000),
+                "recent hits must carry the µs updated_at: {hit:?}"
+            );
+        }
+
+        // Search hits keep the relevance rank and carry no recency timestamp.
+        let searched = store
+            .reader
+            .search_pages_for_project(ws, proj, "Body".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(!searched.is_empty(), "the FTS search should match");
+        assert!(
+            searched.iter().all(|h| h.updated_at_us.is_none()),
+            "search hits must not carry updated_at_us: {searched:?}"
+        );
     }
 
     #[tokio::test]

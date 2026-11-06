@@ -5366,7 +5366,7 @@ if (inheritOnly) {
             Some("repo-root"),
         );
 
-        // SessionStart and Stop should be present
+        // Windows/Antigravity template only renders SessionStart and Stop (FR-001)
         for pointer in [
             "/ai-memory/SessionStart/0/command",
             "/ai-memory/Stop/0/command",

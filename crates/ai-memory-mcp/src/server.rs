@@ -235,7 +235,6 @@ Tool index (each tool's full routing follows):\n\
   propose lessons from a finished session; `memory_lint` audit the wiki; \
   `memory_forget_sweep` prune expired and cold pages; \
   `memory_install_self_routing` install this routing into a project.\n\
-\n\
 - `memory_query` — when the user references prior work you don't \
   recognise, or asks 'have we done / discussed X', or you're about \
   to propose architecture (always check first). Defaults to the \
@@ -11253,8 +11252,6 @@ mod tests {
         "memory_lint",
         "memory_forget_sweep",
         "memory_install_self_routing",
-        "sulur_patch",
-        "sulur_read_memory",
     ];
 
     const DETAILED_ROUTING_TOOL_NAMES: &[&str] = &[
@@ -11284,8 +11281,6 @@ mod tests {
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
-        "sulur_patch",
-        "sulur_read_memory",
     ];
 
     #[test]
