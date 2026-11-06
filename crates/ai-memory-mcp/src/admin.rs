@@ -834,9 +834,7 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/rename-workspace", post(handle_rename_workspace))
         .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
-        .route("/admin/delete-page", post(handle_delete_page))
-        .route("/admin/sulur-read-memory", get(handle_sulur_read_memory))
-        .route("/admin/sulur-patch", post(handle_sulur_patch));
+        .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
         .route("/admin/users", get(handle_list_users))
         .route("/admin/human-users", post(handle_create_human_user))

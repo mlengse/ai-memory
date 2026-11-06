@@ -19,10 +19,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 jiff.workspace = true
-# SHA-256 for per-section content hashes (CAS preconditions,
-# specs/032-cas-memory-patch). Kept here so the hash definition lives with the
-# Section entity it describes.
-sha2.workspace = true
 regex.workspace = true
 icu_normalizer.workspace = true
 # JsonSchema on Tier/PageKind so the consolidation prompt's

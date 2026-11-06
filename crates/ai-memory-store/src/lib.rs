@@ -63,22 +63,22 @@ pub use decay::{
 pub use error::{
     AmbiguousMatch, AmbiguousProjectHolder, AmbiguousProjectHolders, StoreError, StoreResult,
 };
-pub use grants::{GrantFilter, GrantListing, GrantOutcome, MemoryRole, ProjectGrant};
+pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CasPreconditions,
+    AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord,
     CompactSummary, Compaction, ConditionalBatchUpsert, ConditionalUpsert, DateOnlyTtlPage,
     DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
     HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
     IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
-    MemoryPatchOperation, MemoryPatchOutcome, MergeProjectPage, MergeProjectSummary,
+    MergeProjectPage, MergeProjectSummary,
     MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
     PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
     ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
     RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
     SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
-    backfill_page_windows_in_batches, create_memory_page, load_memory_page, patch_memory_section,
-    purge_session, record_embed_failure, upsert_memory_page,
+    backfill_page_windows_in_batches,
+    purge_session, record_embed_failure,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_DIGEST_READ_CAP, PROFILE_HARVEST_BATCH,
@@ -87,8 +87,8 @@ pub use profile::{
     ProjectProfileFlags,
 };
 pub use project_authz::{
-    AccessMode, GrantLevel, MEMORY_PATCH_VIEWER_FORBIDDEN, ProjectAccess, ProjectAuthz,
-    ProjectPrincipal, RESTRICTED_PROJECT_FORBIDDEN, authorize_memory_patch, authorize_project,
+    AccessMode, GrantLevel, ProjectAccess, ProjectAuthz,
+    ProjectPrincipal, RESTRICTED_PROJECT_FORBIDDEN, authorize_project,
     resolve_project_authz,
 };
 pub use query_signals::{
@@ -117,7 +117,7 @@ pub use reader::{
     StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
     TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WorkspaceScopeRow,
     WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
-    project_name_fold_key, read_memory_page,
+    project_name_fold_key,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{

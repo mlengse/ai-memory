@@ -90,8 +90,8 @@ pub use observation::{
     valid_file_path_key,
 };
 pub use page::{
-    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, MemoryPage, NewPage, Page,
-    PageEvidence, PageEvidenceKind, PageType, Relation, Section, Tier, content_hash,
+    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page,
+    PageEvidence, PageEvidenceKind, Relation, Tier,
     frontmatter_entity_names, normalize_entities, normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{

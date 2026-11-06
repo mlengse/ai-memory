@@ -248,29 +248,6 @@ pub fn authorize_project(ctx: &ProjectAuthz, need: ProjectAccess) -> Result<(), 
     ctx.authorize(need)
 }
 
-/// Denial message surfaced when a `viewer` attempts to patch a memory page.
-pub const MEMORY_PATCH_VIEWER_FORBIDDEN: &str =
-    "only an editor may patch a memory page; viewers may read only";
-
-/// Enforce the role rule for the CAS patch surface (FR-008): an `editor` may
-/// patch, a `viewer` may read only.
-///
-/// This is the single role gate every memory-patch entry point funnels through,
-/// checked **before** any precondition evaluation or write, so a refused role
-/// touches nothing.
-///
-/// # Errors
-/// [`StoreError::Unauthorized`] when `role` is not an editor.
-pub fn authorize_memory_patch(role: crate::grants::MemoryRole) -> crate::error::StoreResult<()> {
-    if role.may_patch() {
-        Ok(())
-    } else {
-        Err(crate::error::StoreError::Unauthorized(
-            MEMORY_PATCH_VIEWER_FORBIDDEN.to_owned(),
-        ))
-    }
-}
-
 /// The facts [`resolve_project_authz`] reads from a project's row.
 struct ProjectRow {
     access_mode: AccessMode,

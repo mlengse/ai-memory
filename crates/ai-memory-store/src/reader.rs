@@ -3187,32 +3187,6 @@ impl ReaderPool {
         .map_err(|e| StoreError::PoolPanic(e.to_string()))?
     }
 
-    /// Execute a closure with mutable access to a pooled connection.
-    /// This is like [`with_conn`] but provides `&mut Connection` for operations
-    /// that need to modify the database through a transaction.
-    pub async fn with_conn_mut<F, T>(&self, f: F) -> StoreResult<T>
-    where
-        F: FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let inner = self.inner.clone();
-        let permit = inner
-            .in_flight
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| StoreError::ReaderClosed)?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut conn = checkout(&inner)?;
-            let result = f(&mut conn);
-            checkin(&inner, conn);
-            result
-        })
-        .await
-        .map_err(|e| StoreError::PoolPanic(e.to_string()))?
-    }
-
     /// The repository a managed run belongs to, or `None` when no such run
     /// exists.
     ///
@@ -16670,23 +16644,6 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
     let conn = Connection::open_with_flags(path, flags)?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(conn)
-}
-
-/// Read a memory page: its heading list, per-section SHA-256, and current
-/// `page_id`/`revision_id` (FR-001, specs/032-cas-memory-patch).
-///
-/// A pure read that changes no state, so it is safe on the read pool. Thin
-/// wrapper over [`crate::ops::load_memory_page`] so the patch path and the read
-/// path agree on exactly how a page is materialised.
-///
-/// # Errors
-/// [`crate::error::StoreError::NotFound`] when no such page exists; propagates
-/// SQL errors.
-pub fn read_memory_page(
-    conn: &Connection,
-    page_id: uuid::Uuid,
-) -> crate::error::StoreResult<ai_memory_core::MemoryPage> {
-    crate::ops::load_memory_page(conn, page_id)
 }
 
 #[cfg(test)]

@@ -405,46 +405,6 @@ pub fn list_grants(conn: &Connection, filter: GrantFilter) -> StoreResult<Vec<Gr
     Ok(out)
 }
 
-/// The acting role of an agent reaching a memory page (FR-008).
-///
-/// A plain per-request enum rather than a `project_grants` row: the CAS patch
-/// surface (specs/032-cas-memory-patch) carries the caller's role on every
-/// request, and the gate only needs to answer "may this role write?".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryRole {
-    /// May read and patch sections.
-    Editor,
-    /// May read only.
-    Viewer,
-}
-
-impl MemoryRole {
-    /// Stable snake_case token used on the tool boundary and in tests.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            MemoryRole::Editor => "editor",
-            MemoryRole::Viewer => "viewer",
-        }
-    }
-
-    /// Parse the token sent by a caller; anything else is a viewer, so an
-    /// unreadable role can only ever deny a write (fail-closed).
-    #[must_use]
-    pub fn from_token(token: &str) -> Self {
-        match token {
-            "editor" => MemoryRole::Editor,
-            _ => MemoryRole::Viewer,
-        }
-    }
-
-    /// Whether this role may run a patch. Only [`Self::Editor`] may.
-    #[must_use]
-    pub const fn may_patch(self) -> bool {
-        matches!(self, MemoryRole::Editor)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

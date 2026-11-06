@@ -319,28 +319,6 @@ pub enum StoreError {
     #[error("forbidden: {0}")]
     Forbidden(&'static str),
 
-    /// A CAS precondition (`expected_content_hash` / `expected_revision_id`)
-    /// did not match the current section or page state. The patch is refused
-    /// and nothing is written (FR-002, FR-003; specs/032-cas-memory-patch).
-    #[error("precondition failed: {0}")]
-    PreconditionFailed(String),
-
-    /// A role-based access check refused a patch: only an `editor` may modify a
-    /// memory page, `viewer` may read only (FR-008).
-    #[error("unauthorized: {0}")]
-    Unauthorized(String),
-
-    /// A patch named a section that does not exist on the target page
-    /// (`replace`/`append`) — the edge case the spec refuses rather than
-    /// silently treating as an add.
-    #[error("section not found: {0}")]
-    SectionNotFound(String),
-
-    /// A patch operation is invalid for the given target — e.g. `add` for a
-    /// heading that already exists on the page.
-    #[error("invalid operation: {0}")]
-    InvalidOperation(String),
-
     /// A persisted row contains malformed data.
     #[error("malformed record: {0}")]
     MalformedRecord(String),
