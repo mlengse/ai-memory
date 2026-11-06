@@ -1885,26 +1885,6 @@ struct PatchPageArgs {
 }
 
 /// Bounds for `memory_read_page`'s `max_chars`. The default keeps a typical
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    #[serde(default)]
-    project: Option<String>,
-
-
-
-
 /// page read well under a context window while staying large enough that
 /// most pages never truncate; the ceiling still lets a caller read a long
 /// page whole by raising it explicitly.
