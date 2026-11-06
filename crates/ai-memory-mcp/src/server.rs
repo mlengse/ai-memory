@@ -236,9 +236,9 @@ Tool index (each tool's full routing follows):\n\
   `memory_forget_sweep` prune expired and cold pages; \
   `memory_install_self_routing` install this routing into a project.\n\
 \n\
-Store-surface CAS patching: `sulur_patch` replace/add/append a section with 
+Store-surface CAS patching: `sulur_patch` replace/add/append a section with
 \r
-  optional preconditions and role-based access; `sulur_read_memory` read a page 
+  optional preconditions and role-based access; `sulur_read_memory` read a page
 \r
   by page_id returning heading list + per-section hashes + revision_id.
 \r
@@ -1947,6 +1947,48 @@ struct SulurPatchArgs {
 fn default_section_order() -> u32 {
     1
 }
+
+/// Arguments for the `sulur_remember` tool: create or update a memory page
+/// with optional CAS preconditions.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct SulurRememberArgs {
+    /// Optional existing page_id to update. If omitted, creates a new page.
+    #[serde(default)]
+    page_id: Option<String>,
+    /// Memory page type: `procedural` or `semantic`.
+    page_type: String,
+    /// Sections to create/update. At least one section is required.
+    sections: Vec<MemorySectionInput>,
+    /// Optional CAS precondition: expected current section content hash (SHA-256) of the first section.
+    #[serde(default)]
+    expected_content_hash: Option<String>,
+    /// Optional CAS precondition: expected current page revision_id.
+    #[serde(default)]
+    expected_revision_id: Option<String>,
+    /// Role of the requesting agent: `editor` (may write) or `viewer` (read only).
+    actor_role: String,
+    /// Workspace for the target page. Session-aware clients may omit it.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project for the target page. Session-aware clients may omit it.
+    #[serde(default)]
+    project: Option<String>,
+    /// Stable id of an existing project. Requires `workspace`.
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+/// A section input for `sulur_remember`.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct MemorySectionInput {
+    /// `## Heading` text of the section.
+    heading: String,
+    /// Section order within page (1-based).
+    order: u32,
+    /// Section body (Markdown).
+    content: String,
+}
+
 /// page read well under a context window while staying large enough that
 /// most pages never truncate; the ceiling still lets a caller read a long
 /// page whole by raising it explicitly.
@@ -6440,6 +6482,149 @@ impl AiMemoryServer {
             "content_hash": outcome.content_hash,
             "operation": outcome.operation.as_str(),
             "revision_snapshot_recorded": outcome.revision_snapshot_recorded,
+        }))
+    }
+
+    /// Create or update a memory page (procedural/semantic) with optional
+    /// CAS preconditions. This is the `sulur_remember` entry point for the
+    /// store surface (page_id-based), not the path-based wiki surface.
+    #[tool(
+        annotations(
+            title = "Remember memory page (store)",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        description = "Create or update a procedural/semantic memory page by page_id with optional CAS preconditions (expected_content_hash, expected_revision_id) and role-based access (editor/viewer). Operates on the store surface (page_id-based). Returns the page_id, revision_id, and sections with their hashes."
+    )]
+    async fn sulur_remember(
+        &self,
+        Parameters(args): Parameters<SulurRememberArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        let scope = self
+            .resolve_existing_project_id_as(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                args.project_id.as_deref(),
+                viewer,
+                ai_memory_store::ProjectAccess::Write,
+            )
+            .await?;
+        let (_ws, _proj) = match scope {
+            Some(ids) => ids,
+            None => {
+                return Err(McpError::invalid_params(
+                    "could not resolve workspace/project for remember",
+                    None,
+                ));
+            }
+        };
+
+        let role = match args.actor_role.as_str() {
+            "editor" => ai_memory_store::MemoryRole::Editor,
+            "viewer" => ai_memory_store::MemoryRole::Viewer,
+            _ => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "invalid actor_role: {} (must be 'editor' or 'viewer')",
+                        args.actor_role
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        // Only editors may write
+        if !role.may_patch() {
+            return Err(McpError::invalid_params(
+                "unauthorized: only an editor may write a memory page",
+                None,
+            ));
+        }
+
+        let page_type: ai_memory_core::PageType = args.page_type.parse().map_err(|_| {
+            McpError::invalid_params(
+                format!(
+                    "invalid page_type: {} (want procedural|semantic)",
+                    args.page_type
+                ),
+                None,
+            )
+        })?;
+
+        if args.sections.is_empty() {
+            return Err(McpError::invalid_params(
+                "at least one section is required",
+                None,
+            ));
+        }
+
+        let sections: Vec<ai_memory_core::Section> = args
+            .sections
+            .into_iter()
+            .map(|s| ai_memory_core::Section::new(s.heading, s.order, s.content))
+            .collect();
+
+        let page_id = args
+            .page_id
+            .as_deref()
+            .map(|s| uuid::Uuid::parse_str(s))
+            .transpose()
+            .map_err(|e| McpError::invalid_params(format!("invalid page_id: {e}"), None))?;
+
+        let preconditions = ai_memory_store::CasPreconditions {
+            expected_content_hash: args.expected_content_hash.clone(),
+            expected_revision_id: args
+                .expected_revision_id
+                .as_ref()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+        };
+
+        let outcome = self
+            .reader
+            .with_conn_mut(move |conn| {
+                ai_memory_store::upsert_memory_page(
+                    conn,
+                    page_type,
+                    &sections,
+                    page_id,
+                    &preconditions,
+                )
+            })
+            .await
+            .map_err(|e| match e {
+                ai_memory_store::StoreError::PreconditionFailed(_) => {
+                    McpError::invalid_params("precondition_failed", None)
+                }
+                ai_memory_store::StoreError::Unauthorized(_) => {
+                    McpError::invalid_params("unauthorized", None)
+                }
+                ai_memory_store::StoreError::NotFound(_) => {
+                    McpError::invalid_params("not_found", None)
+                }
+                _ => McpError::internal_error(e.to_string(), None),
+            })?;
+
+        let sections_json: Vec<serde_json::Value> = outcome
+            .sections
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "heading": s.heading,
+                    "order": s.order,
+                    "content_hash": s.content_hash,
+                })
+            })
+            .collect();
+
+        ok_json(&serde_json::json!({
+            "page_id": outcome.page_id.to_string(),
+            "revision_id": outcome.revision_id.to_string(),
+            "page_type": outcome.page_type.as_str(),
+            "sections": sections_json,
         }))
     }
 

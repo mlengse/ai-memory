@@ -9648,6 +9648,115 @@ pub fn create_memory_page(
     })
 }
 
+/// Create or update a memory page with optional CAS preconditions.
+///
+/// This is the `sulur_remember` entry point: it creates a new memory page
+/// or updates an existing one, with optional `expected_revision_id` and
+/// `expected_content_hash` preconditions on the first section (for the
+/// common case of remembering/updating a single-section page).
+///
+/// If `page_id` is provided and the page exists, it updates the page
+/// (replacing all sections) subject to preconditions. If `page_id` is
+/// not provided, it creates a new page.
+///
+/// # Errors
+/// [`StoreError::PreconditionFailed`] if any provided precondition mismatches
+/// the current state; no write occurs.
+/// [`StoreError::NotFound`] if `page_id` is provided but no such page exists.
+pub fn upsert_memory_page(
+    conn: &mut rusqlite::Connection,
+    page_type: ai_memory_core::PageType,
+    sections: &[ai_memory_core::Section],
+    page_id: Option<uuid::Uuid>,
+    preconditions: &CasPreconditions,
+) -> StoreResult<ai_memory_core::MemoryPage> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+
+    let (page_id, revision_id) = if let Some(existing_id) = page_id {
+        // Update existing page - check preconditions first
+        let current = load_memory_page(&tx, existing_id)?;
+
+        // Check revision precondition
+        if let Some(expected) = preconditions.expected_revision_id
+            && current.revision_id != expected
+        {
+            return Err(StoreError::PreconditionFailed(format!(
+                "revision_id expected {expected}, current {}",
+                current.revision_id
+            )));
+        }
+
+        // Check content hash precondition on first section (if any sections exist)
+        if let Some(expected_hash) = &preconditions.expected_content_hash
+            && let Some(first_section) = current.sections.first()
+            && &first_section.content_hash != expected_hash
+        {
+            return Err(StoreError::PreconditionFailed(format!(
+                "content_hash expected {expected_hash}, current {}",
+                first_section.content_hash
+            )));
+        }
+
+        // Delete existing sections
+        tx.execute(
+            "DELETE FROM memory_sections WHERE page_id = ?1",
+            rusqlite::params![existing_id.as_bytes()],
+        )?;
+
+        // Update page revision
+        let new_revision_id = uuid::Uuid::now_v7();
+        tx.execute(
+            "UPDATE memory_pages SET revision_id = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![new_revision_id.as_bytes(), now, existing_id.as_bytes()],
+        )?;
+
+        (existing_id, new_revision_id)
+    } else {
+        // Create new page
+        let new_page_id = uuid::Uuid::now_v7();
+        let new_revision_id = uuid::Uuid::now_v7();
+        tx.execute(
+            "INSERT INTO memory_pages (id, revision_id, page_type, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            rusqlite::params![
+                new_page_id.as_bytes(),
+                new_revision_id.as_bytes(),
+                page_type.as_str(),
+                now,
+            ],
+        )?;
+        (new_page_id, new_revision_id)
+    };
+
+    // Insert/replace sections
+    let mut stored = Vec::with_capacity(sections.len());
+    for section in sections {
+        let hash = insert_memory_section_in_tx(
+            &tx,
+            page_id,
+            section.order,
+            &section.heading,
+            &section.content,
+            now,
+        )?;
+        stored.push(ai_memory_core::Section {
+            heading: section.heading.clone(),
+            order: section.order,
+            content: section.content.clone(),
+            content_hash: hash,
+        });
+    }
+
+    tx.commit()?;
+    Ok(ai_memory_core::MemoryPage {
+        page_id,
+        revision_id,
+        page_type,
+        sections: stored,
+    })
+}
+
 /// Load a memory page (header + ordered sections) from a connection.
 ///
 /// `conn` may be a `rusqlite::Transaction`, which derefs to `Connection`.

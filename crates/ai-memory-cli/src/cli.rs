@@ -220,6 +220,10 @@ pub enum Command {
     ReadPage(ReadPageArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
+    /// Read a memory page (procedural/semantic) by page_id via the store surface.
+    SulurReadMemory(SulurReadMemoryArgs),
+    /// Patch a memory page section (replace/add/append) with optional CAS preconditions.
+    SulurPatch(SulurPatchArgs),
     /// Delete a single wiki page. The server routes scope resolution
     /// through `resolve_ws_proj`, so a delete targeting a project that
     /// exists in multiple workspaces never silently lands in the wrong
@@ -3861,6 +3865,67 @@ pub struct WritePageArgs {
     /// current project using the same resolver as read-page/search.
     #[arg(long)]
     pub project: Option<String>,
+}
+
+/// Arguments for `ai-memory sulur-read-memory` — read a memory page by page_id.
+#[derive(Args, Debug, Clone)]
+pub struct SulurReadMemoryArgs {
+    /// Target memory page identity (UUID).
+    #[arg(long, visible_alias = 'i')]
+    pub page_id: String,
+    /// Workspace name (auto-detected if omitted).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name within the workspace (auto-detected if omitted).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Stable project id. Mutually exclusive with --project.
+    #[arg(long)]
+    pub project_id: Option<String>,
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `ai-memory sulur-patch` — patch a memory page section.
+#[derive(Args, Debug, Clone)]
+pub struct SulurPatchArgs {
+    /// Target memory page identity (UUID).
+    #[arg(long, visible_alias = 'i')]
+    pub page_id: String,
+    /// Section heading (without the leading ## ).
+    #[arg(long)]
+    pub section_heading: String,
+    /// Section order within page (1-based).
+    #[arg(long, default_value = "1")]
+    pub section_order: u32,
+    /// Patch operation: replace | add | append.
+    #[arg(long)]
+    pub operation: String,
+    /// New section content (Markdown). Required for replace and add.
+    #[arg(long)]
+    pub new_content: Option<String>,
+    /// Optional CAS precondition: expected current section content hash (SHA-256).
+    #[arg(long)]
+    pub expected_content_hash: Option<String>,
+    /// Optional CAS precondition: expected current page revision_id.
+    #[arg(long)]
+    pub expected_revision_id: Option<String>,
+    /// Role of the requesting agent: editor | viewer.
+    #[arg(long)]
+    pub actor_role: String,
+    /// Workspace name (auto-detected if omitted).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name within the workspace (auto-detected if omitted).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Stable project id. Mutually exclusive with --project.
+    #[arg(long)]
+    pub project_id: Option<String>,
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[cfg(test)]

@@ -119,6 +119,8 @@ pub mod setup_agent;
 pub(crate) mod setup_web;
 pub mod show;
 pub mod status;
+pub mod sulur_patch;
+pub mod sulur_read_memory;
 pub mod transcript_capture;
 pub mod uninstall;
 pub mod upgrade;
