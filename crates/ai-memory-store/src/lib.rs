@@ -19,12 +19,12 @@ mod auto_improve;
 pub mod belief;
 mod dashboard;
 pub mod decay;
-mod error;
+pub mod error;
 mod fts_query;
-mod grants;
+pub mod grants;
 mod maintenance;
 mod migrations;
-mod ops;
+pub mod ops;
 pub mod password;
 mod profile;
 mod provenance;
@@ -63,7 +63,9 @@ pub use decay::{
 pub use error::{
     AmbiguousMatch, AmbiguousProjectHolder, AmbiguousProjectHolders, StoreError, StoreResult,
 };
-pub use grants::{GrantFilter, GrantListing, GrantOutcome, MemoryRole, ProjectGrant};
+pub use grants::{
+    GrantFilter, GrantListing, GrantOutcome, MemoryRole, ProjectGrant,
+};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CasPreconditions,
@@ -78,7 +80,7 @@ pub use ops::{
     RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
     SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, create_memory_page, patch_memory_section, purge_session,
-    record_embed_failure,
+    record_embed_failure, load_memory_page,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_DIGEST_READ_CAP, PROFILE_HARVEST_BATCH,

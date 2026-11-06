@@ -3187,6 +3187,32 @@ impl ReaderPool {
         .map_err(|e| StoreError::PoolPanic(e.to_string()))?
     }
 
+    /// Execute a closure with mutable access to a pooled connection.
+    /// This is like [`with_conn`] but provides `&mut Connection` for operations
+    /// that need to modify the database through a transaction.
+    pub async fn with_conn_mut<F, T>(&self, f: F) -> StoreResult<T>
+    where
+        F: FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        let permit = inner
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StoreError::ReaderClosed)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut conn = checkout(&inner)?;
+            let result = f(&mut conn);
+            checkin(&inner, conn);
+            result
+        })
+        .await
+        .map_err(|e| StoreError::PoolPanic(e.to_string()))?
+    }
+
     /// The repository a managed run belongs to, or `None` when no such run
     /// exists.
     ///

@@ -236,6 +236,14 @@ Tool index (each tool's full routing follows):\n\
   `memory_forget_sweep` prune expired and cold pages; \
   `memory_install_self_routing` install this routing into a project.\n\
 \n\
+Store-surface CAS patching: `sulur_patch` replace/add/append a section with 
+\r
+  optional preconditions and role-based access; `sulur_read_memory` read a page 
+\r
+  by page_id returning heading list + per-section hashes + revision_id.
+\r
+
+\r
 - `memory_query` — when the user references prior work you don't \
   recognise, or asks 'have we done / discussed X', or you're about \
   to propose architecture (always check first). Defaults to the \
@@ -1877,6 +1885,68 @@ struct PatchPageArgs {
 }
 
 /// Bounds for `memory_read_page`'s `max_chars`. The default keeps a typical
+
+/// Arguments for `sulur_read_memory` — read a memory page by page_id
+/// (store surface, not wiki surface).
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct SulurReadMemoryArgs {
+    /// Target memory page identity.
+    page_id: String,
+    /// Workspace to read from. Session-aware clients may omit it for the
+    /// current project; static MCP clients must pass it together with
+    /// `project` for every project-scoped call.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project to read from. Session-aware clients may omit it for the
+    /// current project. Static MCP clients must pass it together with
+    /// `workspace` for every project-scoped call.
+    #[serde(default)]
+    project: Option<String>,
+    /// Stable id of an existing project. Requires `workspace`, is mutually
+    /// exclusive with `project` and never creates a project.
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+/// Arguments for `sulur_patch` — patch a memory page section (store surface).
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct SulurPatchArgs {
+    /// Target memory page identity.
+    page_id: String,
+    /// `## Heading` text of the section to patch.
+    section_heading: String,
+    /// Section order within page (defaults to 1); combined with heading for
+    /// unique identification.
+    #[serde(default = "default_section_order")]
+    section_order: u32,
+    /// Patch operation type: `replace`, `add`, or `append`.
+    operation: String,
+    /// New section body (Markdown). Required for `replace` and `add`.
+    #[serde(default)]
+    new_content: Option<String>,
+    /// Optional CAS precondition: expected current section content hash (SHA-256).
+    #[serde(default)]
+    expected_content_hash: Option<String>,
+    /// Optional CAS precondition: expected current page revision_id.
+    #[serde(default)]
+    expected_revision_id: Option<String>,
+    /// Role of the requesting agent: `editor` (may patch) or `viewer` (read only).
+    actor_role: String,
+    /// Workspace for the target page. Session-aware clients may omit it.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project for the target page. Session-aware clients may omit it.
+    /// Static MCP clients must pass it together with `workspace` for every project-scoped call.
+    #[serde(default)]
+    project: Option<String>,
+    /// Stable id of an existing project. Requires `workspace`.
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+fn default_section_order() -> u32 {
+    1
+}
 /// page read well under a context window while staying large enough that
 /// most pages never truncate; the ceiling still lets a caller read a long
 /// page whole by raising it explicitly.
@@ -6194,6 +6264,183 @@ impl AiMemoryServer {
             }
         }
         result
+    }
+
+    /// Read a memory page by page_id, returning heading list + per-section
+    /// SHA-256 + page_id/revision_id. This is the store-surface read (not
+    /// path-based wiki read).
+    #[tool(
+        annotations(
+            title = "Read memory page (store)",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Read a procedural/semantic memory page by its page_id. Returns heading list, per-section SHA-256 hashes, page_id, and revision_id. This operates on the store surface (page_id-based), not the wiki surface (path-based)."
+    )]
+    async fn sulur_read_memory(
+        &self,
+        Parameters(args): Parameters<SulurReadMemoryArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        let scope = self
+            .resolve_existing_project_id_as(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                args.project_id.as_deref(),
+                viewer,
+                ai_memory_store::ProjectAccess::Read,
+            )
+            .await?;
+        let (_ws, _proj) = match scope {
+            Some(ids) => ids,
+            None => {
+                return Err(McpError::invalid_params(
+                    "could not resolve workspace/project for read",
+                    None,
+                ));
+            }
+        };
+
+        let page_id = uuid::Uuid::parse_str(&args.page_id)
+            .map_err(|e| McpError::invalid_params(format!("invalid page_id: {e}"), None))?;
+
+        let page = self
+            .reader
+            .with_conn(move |conn| ai_memory_store::load_memory_page(conn, page_id))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let sections: Vec<serde_json::Value> = page
+            .sections
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "heading": s.heading,
+                    "order": s.order,
+                    "content_hash": s.content_hash,
+                })
+            })
+            .collect();
+
+        ok_json(&serde_json::json!({
+            "page_id": page.page_id.to_string(),
+            "revision_id": page.revision_id.to_string(),
+            "page_type": page.page_type.as_str(),
+            "sections": sections,
+        }))
+    }
+
+    /// Patch a memory page section (replace/add/append) with optional CAS
+    /// preconditions. This is the store-surface patch (not path-based wiki patch).
+    #[tool(
+        annotations(
+            title = "Patch memory section (store)",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        description = "Patch a specific section of a procedural/semantic memory page by page_id. Supports replace, add, and append operations with optional CAS preconditions (expected_content_hash, expected_revision_id) and role-based access (editor/viewer). Operates on the store surface (page_id-based)."
+    )]
+    async fn sulur_patch(
+        &self,
+        Parameters(args): Parameters<SulurPatchArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        let scope = self
+            .resolve_existing_project_id_as(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                args.project_id.as_deref(),
+                viewer,
+                ai_memory_store::ProjectAccess::Write,
+            )
+            .await?;
+        let (_ws, _proj) = match scope {
+            Some(ids) => ids,
+            None => {
+                return Err(McpError::invalid_params(
+                    "could not resolve workspace/project for patch",
+                    None,
+                ));
+            }
+        };
+
+        let page_id = uuid::Uuid::parse_str(&args.page_id)
+            .map_err(|e| McpError::invalid_params(format!("invalid page_id: {e}"), None))?;
+
+        let operation = args
+            .operation
+            .parse::<ai_memory_store::MemoryPatchOperation>()
+            .map_err(|e| McpError::invalid_params(format!("invalid operation: {e}"), None))?;
+
+        let role = match args.actor_role.as_str() {
+            "editor" => ai_memory_store::MemoryRole::Editor,
+            "viewer" => ai_memory_store::MemoryRole::Viewer,
+            _ => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "invalid actor_role: {} (must be 'editor' or 'viewer')",
+                        args.actor_role
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        let preconditions = ai_memory_store::CasPreconditions {
+            expected_content_hash: args.expected_content_hash.clone(),
+            expected_revision_id: args
+                .expected_revision_id
+                .as_ref()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+        };
+
+        let new_content = args.new_content.clone().unwrap_or_default();
+        let outcome = self
+            .reader
+            .with_conn_mut(move |conn| {
+                ai_memory_store::patch_memory_section(
+                    conn,
+                    page_id,
+                    operation,
+                    &args.section_heading,
+                    args.section_order,
+                    &new_content,
+                    &preconditions,
+                    role,
+                )
+            })
+            .await
+            .map_err(|e| match e {
+                ai_memory_store::StoreError::PreconditionFailed(_) => {
+                    McpError::invalid_params("precondition_failed", None)
+                }
+                ai_memory_store::StoreError::Unauthorized(_) => {
+                    McpError::invalid_params("unauthorized", None)
+                }
+                ai_memory_store::StoreError::SectionNotFound(_) => {
+                    McpError::invalid_params("section_not_found", None)
+                }
+                ai_memory_store::StoreError::InvalidOperation(_) => {
+                    McpError::invalid_params("invalid_operation", None)
+                }
+                _ => McpError::internal_error(e.to_string(), None),
+            })?;
+
+        ok_json(&serde_json::json!({
+            "page_id": outcome.page_id.to_string(),
+            "revision_id": outcome.revision_id.to_string(),
+            "section_heading": outcome.section_heading,
+            "section_order": outcome.section_order,
+            "content_hash": outcome.content_hash,
+            "operation": outcome.operation.as_str(),
+            "revision_snapshot_recorded": outcome.revision_snapshot_recorded,
+        }))
     }
 
     /// Read one session's raw lifecycle observations, in scope, paged and
@@ -11253,6 +11500,8 @@ mod tests {
         "memory_lint",
         "memory_forget_sweep",
         "memory_install_self_routing",
+        "sulur_patch",
+        "sulur_read_memory",
     ];
 
     const DETAILED_ROUTING_TOOL_NAMES: &[&str] = &[

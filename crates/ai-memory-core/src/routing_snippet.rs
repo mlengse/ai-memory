@@ -130,6 +130,16 @@ security, evidence, schema, and output rules.
 Browser inbox messages may target a harness within a project. Consult the
 installed messaging skill for the receiving-harness identity on a claim.
 
+### Store-surface CAS patching
+
+- `sulur_read_memory` — read a memory page by page_id, returning heading list,
+  per-section SHA-256 hashes, page_id, and revision_id. Operates on the
+  store surface (page_id-based), not the wiki surface (path-based).
+- `sulur_patch` — replace, add, or append a section of a procedural/semantic
+  memory page by page_id, with optional CAS preconditions (expected_content_hash,
+  expected_revision_id) and role-based access (editor/viewer). Operates on the
+  store surface (page_id-based), not the wiki surface (path-based).
+
 ### Use the installed ai-memory Agent Skills
 
 Detailed tool-routing guidance lives in the installed ai-memory Agent

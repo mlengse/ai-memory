@@ -9654,7 +9654,7 @@ pub fn create_memory_page(
 ///
 /// # Errors
 /// [`StoreError::NotFound`] when no such page exists; propagates SQL errors.
-pub(crate) fn load_memory_page(
+pub fn load_memory_page(
     conn: &rusqlite::Connection,
     page_id: uuid::Uuid,
 ) -> StoreResult<ai_memory_core::MemoryPage> {
