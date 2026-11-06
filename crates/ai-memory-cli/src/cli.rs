@@ -220,10 +220,6 @@ pub enum Command {
     ReadPage(ReadPageArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
-    /// Read a memory page (procedural/semantic) by page_id via the store surface.
-    SulurReadMemory(SulurReadMemoryArgs),
-    /// Patch a memory page section (replace/add/append) with optional CAS preconditions.
-    SulurPatch(SulurPatchArgs),
     /// Delete a single wiki page. The server routes scope resolution
     /// through `resolve_ws_proj`, so a delete targeting a project that
     /// exists in multiple workspaces never silently lands in the wrong
