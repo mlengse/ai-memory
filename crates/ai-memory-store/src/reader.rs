@@ -1377,7 +1377,8 @@ pub struct SearchExplain {
     pub query_signal_boost: Option<f64>,
 }
 
-/// One hit returned by [`ReaderPool::search_pages`].
+/// One hit returned by [`ReaderPool::search_pages`] and the `recent*`
+/// listings.
 #[derive(Debug, Clone, Serialize)]
 pub struct PageHit {
     /// Stable identifier for this page version.
@@ -1390,8 +1391,14 @@ pub struct PageHit {
     /// serialized as safe HTML with `<mark>` around genuine matches.
     #[serde(serialize_with = "serialize_highlighted_snippet")]
     pub snippet: String,
-    /// Relevance rank after the bounded authority adjustment (lower is better).
+    /// Sort key, lower is better. Search hits carry the FTS5 relevance rank
+    /// after the bounded authority adjustment; the `recent*` listings carry
+    /// the 0-based recency position (already ordered newest-first).
     pub rank: f64,
+    /// Unix microseconds the page version was last updated. Populated only by
+    /// the `recent*` listings; `None` (and omitted from JSON) for search hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at_us: Option<i64>,
     /// True when this hit is a superseded (non-latest) page version, surfaced
     /// only because the caller opted into `include_superseded`. False for the
     /// current version — the default. Skipped in JSON when false so default
@@ -1853,6 +1860,11 @@ pub struct PageHitWithMeta {
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
+    /// Unix microseconds the page version was last updated. Populated only by
+    /// the global `recent*` listing; `None` (and omitted from JSON) for search
+    /// hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at_us: Option<i64>,
 }
 
 /// One raw observation fallback hit returned when compiled wiki pages miss.
@@ -3439,6 +3451,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },
@@ -3490,6 +3503,7 @@ impl ReaderPool {
                             snippet: page_descriptor(&descriptor, &title),
                             title,
                             rank,
+                            updated_at_us: None,
                             superseded: false,
                             pinned: false,
                         },
@@ -3616,6 +3630,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        updated_at_us: None,
                     },
                     authority,
                 ));
@@ -3672,6 +3687,7 @@ impl ReaderPool {
                             snippet: page_descriptor(&descriptor, &title),
                             title,
                             rank,
+                            updated_at_us: None,
                         },
                         authority,
                     ));
@@ -3804,6 +3820,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },
@@ -3860,6 +3877,7 @@ impl ReaderPool {
                             snippet: page_descriptor(&descriptor, &title),
                             title,
                             rank,
+                            updated_at_us: None,
                             superseded: false,
                             pinned: false,
                         },
@@ -3966,6 +3984,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },
@@ -4024,6 +4043,7 @@ impl ReaderPool {
                             snippet: page_descriptor(&descriptor, &title),
                             title,
                             rank,
+                            updated_at_us: None,
                             superseded: false,
                             pinned: false,
                         },
@@ -4192,6 +4212,7 @@ impl ReaderPool {
                         title: entry.title,
                         snippet: entry.snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },
@@ -4752,7 +4773,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT id, path, title, \
                         {descriptor} AS snip, \
-                        CAST(updated_at AS REAL) AS rank \
+                        updated_at \
                  FROM pages \
                  WHERE is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
@@ -4767,18 +4788,19 @@ impl ReaderPool {
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
                 let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
-                let rank: f64 = row.get(4)?;
-                Ok((id_bytes, path, title, snippet, rank))
+                let updated_at_us: i64 = row.get(4)?;
+                Ok((id_bytes, path, title, snippet, updated_at_us))
             })?;
             let mut hits = Vec::new();
-            for row in rows {
-                let (id_bytes, path, title, snippet, rank) = row?;
+            for (idx, row) in rows.enumerate() {
+                let (id_bytes, path, title, snippet, updated_at_us) = row?;
                 hits.push(PageHit {
                     id: PageId::from_slice(&id_bytes)?,
                     path: PagePath::new(path)?,
                     title,
                     snippet,
-                    rank,
+                    rank: idx as f64,
+                    updated_at_us: Some(updated_at_us),
                     superseded: false,
                     pinned: false,
                 });
@@ -4857,14 +4879,15 @@ impl ReaderPool {
                 Ok((id_bytes, path, title, snippet, rank))
             })?;
             let mut hits = Vec::new();
-            for row in rows {
+            for (idx, row) in rows.enumerate() {
                 let (id_bytes, path, title, snippet, rank) = row?;
                 hits.push(PageHit {
                     id: PageId::from_slice(&id_bytes)?,
                     path: PagePath::new(path)?,
                     title,
                     snippet,
-                    rank,
+                    rank: idx as f64,
+                    updated_at_us: Some(rank as i64),
                     superseded: false,
                     pinned: true,
                 });
@@ -4888,7 +4911,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT id, path, title, \
                         {descriptor} AS snip, \
-                        CAST(updated_at AS REAL) AS rank \
+                        updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
@@ -4910,19 +4933,20 @@ impl ReaderPool {
                     let path: String = row.get(1)?;
                     let title: String = row.get(2)?;
                     let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
-                    let rank: f64 = row.get(4)?;
-                    Ok((id_bytes, path, title, snippet, rank))
+                    let updated_at_us: i64 = row.get(4)?;
+                    Ok((id_bytes, path, title, snippet, updated_at_us))
                 },
             )?;
             let mut hits = Vec::new();
-            for row in rows {
-                let (id_bytes, path, title, snippet, rank) = row?;
+            for (idx, row) in rows.enumerate() {
+                let (id_bytes, path, title, snippet, updated_at_us) = row?;
                 hits.push(PageHit {
                     id: PageId::from_slice(&id_bytes)?,
                     path: PagePath::new(path)?,
                     title,
                     snippet,
-                    rank,
+                    rank: idx as f64,
+                    updated_at_us: Some(updated_at_us),
                     superseded: false,
                     pinned: false,
                 });
@@ -4958,7 +4982,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
-                        CAST(pages.updated_at AS REAL) AS rank, pages.id \
+                        pages.updated_at, pages.id \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
@@ -4978,7 +5002,7 @@ impl ReaderPool {
                 let path: String = row.get(2)?;
                 let title: String = row.get(3)?;
                 let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
-                let rank: f64 = row.get(5)?;
+                let updated_at_us: i64 = row.get(5)?;
                 let id_bytes: Vec<u8> = row.get(6)?;
                 Ok((
                     id_bytes,
@@ -4987,12 +5011,12 @@ impl ReaderPool {
                     path,
                     title,
                     snippet,
-                    rank,
+                    updated_at_us,
                 ))
             })?;
             let mut hits = Vec::new();
-            for row in rows {
-                let (id_bytes, workspace_name, project_name, path, title, snippet, rank) = row?;
+            for (idx, row) in rows.enumerate() {
+                let (id_bytes, workspace_name, project_name, path, title, snippet, updated_at_us) = row?;
                 hits.push(PageHitWithMeta {
                     id: PageId::from_slice(&id_bytes)?,
                     workspace_name,
@@ -5000,7 +5024,8 @@ impl ReaderPool {
                     path: PagePath::new(path)?,
                     title,
                     snippet,
-                    rank,
+                    rank: idx as f64,
+                    updated_at_us: Some(updated_at_us),
                 });
             }
             Ok(hits)
@@ -7938,6 +7963,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank: 0.0,
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },
@@ -8148,6 +8174,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank: 0.0,
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },
@@ -9037,6 +9064,7 @@ impl ReaderPool {
                         title: entry.title,
                         snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },

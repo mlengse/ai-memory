@@ -1982,6 +1982,10 @@ impl Default for MaintenanceSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            // 86_400 seconds = 24 hours. These defaults are intentionally long to
+            // avoid triggering intensive scans every 60 seconds at startup.
+            // The only 60-second figure is MAINTENANCE_STARTUP_DELAY_CAP in serve.rs,
+            // which is a startup catch-up delay cap for overdue maintenance jobs.
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
             embedding_backfill_interval_secs: 0,

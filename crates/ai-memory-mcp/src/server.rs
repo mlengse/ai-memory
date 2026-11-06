@@ -9932,6 +9932,7 @@ mod tests {
                         title: format!("Page {idx}"),
                         snippet: format!("candidate {idx}"),
                         rank: idx as f64,
+                        updated_at_us: None,
                         superseded: false,
                         pinned: false,
                     },
@@ -11252,6 +11253,8 @@ mod tests {
         "memory_lint",
         "memory_forget_sweep",
         "memory_install_self_routing",
+        "sulur_patch",
+        "sulur_read_memory",
     ];
 
     const DETAILED_ROUTING_TOOL_NAMES: &[&str] = &[
@@ -11281,6 +11284,8 @@ mod tests {
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
+        "sulur_patch",
+        "sulur_read_memory",
     ];
 
     #[test]

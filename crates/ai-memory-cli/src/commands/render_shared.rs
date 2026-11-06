@@ -1764,28 +1764,42 @@ fn build_antigravity_payload_for_platform(
 ) -> serde_json::Value {
     let mut group = serde_json::Map::new();
 
-    // Tool events: nested shape (matcher + inner hooks array)
-    for (event, script) in &ANTIGRAVITY_TOOL_EVENTS {
-        let s = script_for_platform(script, platform);
-        let abs = emit_root.join(s.as_ref());
-        let handler = hook_handler_value(hook_handler_spec(
-            &abs,
-            server_url,
-            auth_token,
-            HookCommandContext::new(platform, agent, data_dir, project_strategy),
-            HookShape::Nested,
-        ));
-        group.insert(
-            (*event).to_string(),
-            json!([{
-                "matcher": "",
-                "hooks": [handler],
-            }]),
-        );
+    // Windows/Antigravity template: only render SessionStart and Stop
+    // with windowsHide runner (FR-001, FR-002).
+    // Other platforms keep all events.
+    let is_windows_antigravity = matches!(platform, HookCommandPlatform::Windows);
+
+    if !is_windows_antigravity {
+        // Tool events: nested shape (matcher + inner hooks array)
+        for (event, script) in &ANTIGRAVITY_TOOL_EVENTS {
+            let s = script_for_platform(script, platform);
+            let abs = emit_root.join(s.as_ref());
+            let handler = hook_handler_value(hook_handler_spec(
+                &abs,
+                server_url,
+                auth_token,
+                HookCommandContext::new(platform, agent, data_dir, project_strategy),
+                HookShape::Nested,
+            ));
+            group.insert(
+                (*event).to_string(),
+                json!([{
+                    "matcher": "",
+                    "hooks": [handler],
+                }]),
+            );
+        }
     }
 
     // Lifecycle events: flat shape (direct handler list, no matcher)
-    for (event, script) in &ANTIGRAVITY_LIFECYCLE_EVENTS {
+    // For Windows, only include SessionStart and Stop (FR-001)
+    let lifecycle_events = if is_windows_antigravity {
+        vec![("SessionStart", "session-start.sh"), ("Stop", "stop.sh")]
+    } else {
+        ANTIGRAVITY_LIFECYCLE_EVENTS.to_vec()
+    };
+
+    for (event, script) in &lifecycle_events {
         let s = script_for_platform(script, platform);
         let abs = emit_root.join(s.as_ref());
         let handler = hook_handler_value(hook_handler_spec(
@@ -5338,8 +5352,9 @@ if (inheritOnly) {
         );
     }
 
+    // Windows/Antigravity template only renders SessionStart and Stop (FR-001)
     #[test]
-    fn antigravity_windows_commands_survive_an_outer_powershell_runner() {
+    fn antigravity_windows_only_renders_sessionstart_and_stop() {
         let root = PathBuf::from("C:/Users/alice/.local/share/ai-memory/hooks/antigravity-cli");
         let v = build_antigravity_payload_for_platform(
             &root,
@@ -5351,9 +5366,10 @@ if (inheritOnly) {
             Some("repo-root"),
         );
 
+        // SessionStart and Stop should be present
         for pointer in [
-            "/ai-memory/PreInvocation/0/command",
-            "/ai-memory/PreToolUse/0/hooks/0/command",
+            "/ai-memory/SessionStart/0/command",
+            "/ai-memory/Stop/0/command",
         ] {
             let command = v.pointer(pointer).and_then(Value::as_str).unwrap();
             assert!(
@@ -5384,12 +5400,34 @@ if (inheritOnly) {
                 program.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"),
                 "{pointer}: {program}"
             );
-            assert!(
-                program.contains("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'"),
-                "{pointer}: {program}"
-            );
             assert!(program.contains(".ps1"), "{pointer}: {program}");
         }
+
+        // Verify PreInvocation and PreToolUse are NOT present for Windows (FR-001)
+        assert!(v.pointer("/ai-memory/PreInvocation").is_none());
+        assert!(v.pointer("/ai-memory/PreToolUse").is_none());
+        assert!(v.pointer("/ai-memory/PostToolUse").is_none());
+    }
+
+    #[test]
+    fn antigravity_non_windows_still_renders_all_events() {
+        let root = PathBuf::from("/home/alice/.local/share/ai-memory/hooks/antigravity-cli");
+        let v = build_antigravity_payload_for_platform(
+            &root,
+            "http://localhost:49374",
+            Some("tok'en"),
+            HookCommandPlatform::Posix,
+            "antigravity-cli",
+            None,
+            Some("repo-root"),
+        );
+
+        // Non-Windows should have all events
+        assert!(v.pointer("/ai-memory/PreInvocation").is_some());
+        assert!(v.pointer("/ai-memory/PreToolUse").is_some());
+        assert!(v.pointer("/ai-memory/PostToolUse").is_some());
+        assert!(v.pointer("/ai-memory/SessionStart").is_some());
+        assert!(v.pointer("/ai-memory/Stop").is_some());
     }
 
     #[cfg(windows)]
