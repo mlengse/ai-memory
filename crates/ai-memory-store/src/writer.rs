@@ -5526,35 +5526,6 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
 /// before the replacement takes effect, so a successful replace always leaves
 /// at least one snapshot linked to the revision and section identity it
 /// superseded.
-///
-/// # Errors
-/// Propagates any SQL error.
-pub(crate) fn record_revision_snapshot_in_tx(
-    conn: &Connection,
-    revision_id: Uuid,
-    page_id: Uuid,
-    heading: &str,
-    order: u32,
-    old_content: &str,
-    now: i64,
-) -> StoreResult<()> {
-    conn.execute(
-        "INSERT INTO revision \
-         (id, revision_id, page_id, heading, section_order, old_content, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![
-            Uuid::now_v7().as_bytes(),
-            revision_id.as_bytes(),
-            page_id.as_bytes(),
-            heading,
-            i64::from(order),
-            old_content,
-            now,
-        ],
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

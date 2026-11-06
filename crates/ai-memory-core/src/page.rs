@@ -11,8 +11,6 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use uuid::Uuid;
-
 use crate::ids::{PageId, PagePath, ProjectId, WorkspaceId};
 
 /// Lifetime classification for a page.
